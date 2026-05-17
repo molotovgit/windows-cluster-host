@@ -75,7 +75,7 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     It 'returns Ok=true on a 200 response' {
         $caps = Set-AllOkInvokers `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 200 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
         $r.Ok | Should -BeTrue
         $r.Status | Should -Be 200
@@ -84,17 +84,35 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     It 'returns Ok=true on a 401 (typical MeshCentral unauthenticated GET)' {
         $caps = Set-AllOkInvokers `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 401 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 401; Body = '<html>MeshCentral login required</html>' } }
         (Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null).Ok | Should -BeTrue
     }
 
     It 'returns Ok=false on a 500' {
         $caps = Set-AllOkInvokers `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 500 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 500; Body = '' } }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
         $r.Ok | Should -BeFalse
         $r.Reason | Should -Be 'http-500'
+    }
+
+    It 'returns Ok=false with reason=marker-missing on a captive-portal 200 without the MeshCentral marker' {
+        $caps = Set-AllOkInvokers `
+            -TcpOk      @{ '10.0.0.7:443' = $true } `
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<html><title>Cisco WAP - Authentication Required</title></html>' } }
+        $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Be 'marker-missing'
+    }
+
+    It 'returns Ok=true on a 401 with an empty body (MeshCentral redirect-401 case)' {
+        $caps = Set-AllOkInvokers `
+            -TcpOk      @{ '10.0.0.7:443' = $true } `
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 401; Body = '' } }
+        $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
+        $r.Ok | Should -BeTrue
+        $r.Reason | Should -Be 'ok-401-empty'
     }
 
     It 'returns Ok=false with reason=tcp-closed when the port is closed' {
@@ -145,7 +163,7 @@ Describe 'Find-Controller strategy order' {
         Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '10.0.0.7' } }) -Encoding utf8
         $caps = Set-AllOkInvokers `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 200 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         $r = Find-Controller -ConfigPath $cfgPath 6>$null
         $r.Address | Should -Be '10.0.0.7'
         $r.Source  | Should -Be 'config'
@@ -158,7 +176,7 @@ Describe 'Find-Controller strategy order' {
         $caps = Set-AllOkInvokers `
             -ResolveMap  @('controller.local','10.0.0.7') `
             -TcpOk       @{ '10.0.0.99:443' = $false; '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 200 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         $r = Find-Controller -ConfigPath $cfgPath 6>$null
         $r.Address | Should -Be '10.0.0.7'
         $r.Source  | Should -Be 'dns:controller.local'
@@ -170,7 +188,7 @@ Describe 'Find-Controller strategy order' {
             -ResolveMap  @('controller.local',$null,'controller',$null) `
             -LocalIPv4   @([pscustomobject]@{ IPAddress = '192.168.1.55'; PrefixLength = 24 }) `
             -TcpOk       @{ '192.168.1.10:443' = $true } `
-            -ProbeStatus @{ 'https://192.168.1.10:443/' = 200 }
+            -ProbeStatus @{ 'https://192.168.1.10:443/' = [pscustomobject]@{ Status = 200; Body = 'MeshCentral signon page' } }
         $r = Find-Controller 6>$null
         $r.Address | Should -Be '192.168.1.10'
         $r.Source  | Should -Be 'subnet-scan'
@@ -189,7 +207,7 @@ Describe 'Find-Controller strategy order' {
         $caps = Set-AllOkInvokers `
             -ResolveMap  @('controller.local','10.0.0.7') `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 200 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         Find-Controller -PersistPath $persistPath 6>$null | Out-Null
         Test-Path -LiteralPath $persistPath | Should -BeTrue
         $j = Get-Content -LiteralPath $persistPath -Raw | ConvertFrom-Json
@@ -203,9 +221,22 @@ Describe 'Find-Controller strategy order' {
         Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '10.0.0.7' } }) -Encoding utf8
         $caps = Set-AllOkInvokers `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
-            -ProbeStatus @{ 'https://10.0.0.7:443/' = 200 }
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         Find-Controller -ConfigPath $cfgPath -PersistPath $persistPath 6>$null | Out-Null
         Test-Path -LiteralPath $persistPath | Should -BeFalse
+    }
+
+    It 'does not throw under StrictMode when cluster-config.json lacks controller.address' {
+        $cfgPath = Join-Path $script:tmpRoot 'cfg-no-address.json'
+        # Config has a controller object but the "address" property is missing.
+        Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ port = 443 } }) -Encoding utf8
+        $caps = Set-AllOkInvokers `
+            -ResolveMap  @('controller.local','10.0.0.7') `
+            -TcpOk       @{ '10.0.0.7:443' = $true } `
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = 'MeshCentral here' } }
+        $r = Find-Controller -ConfigPath $cfgPath 6>$null
+        $r.Address | Should -Be '10.0.0.7'
+        $r.Source  | Should -Be 'dns:controller.local'
     }
 
     It 'caps the subnet scan at -MaxSubnetScans' {

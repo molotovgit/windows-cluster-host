@@ -109,18 +109,21 @@ function Get-DefaultDiscoveryInvoker {
             }
         }
 
-        # Probe an HTTPS URL with a short timeout. Returns the int status
-        # code on response, or $null on connection error.
+        # Probe an HTTPS URL with a short timeout. Returns a pscustomobject
+        # @{ Status; Body } -- Status int and a short snippet of the body for
+        # MeshCentral-marker matching. Returns $null on connection error.
         HttpProbe = {
             param([string]$Url, [int]$TimeoutSec)
             try {
                 $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSec `
                                        -SkipCertificateCheck -ErrorAction Stop -Method Get
-                return [int]$r.StatusCode
+                $body = ''
+                try { $body = "$($r.Content)" } catch { $body = '' }
+                return [pscustomobject]@{ Status = [int]$r.StatusCode; Body = $body }
             } catch {
-                # Some non-2xx responses arrive as exceptions on older PS.
                 if ($_.Exception.Response) {
-                    return [int]$_.Exception.Response.StatusCode
+                    # Status reachable but error response; body usually empty here.
+                    return [pscustomobject]@{ Status = [int]$_.Exception.Response.StatusCode; Body = '' }
                 }
                 return $null
             }
@@ -188,14 +191,23 @@ function Reset-DiscoveryInvoker {
 
 function Test-ProbeOk {
     param([int]$Status)
-    return $Status -ge 200 -and $Status -lt 400 -or $Status -eq 401
+    return ($Status -ge 200 -and $Status -lt 400) -or ($Status -eq 401)
 }
 
 function Test-ControllerEndpoint {
     <#
     .SYNOPSIS
-        TCP-probe a host:port then HTTPS-probe the path. Returns a
-        pscustomobject @{ Ok; Status; Url } on success or failure.
+        TCP-probe a host:port then HTTPS-probe the path. To distinguish a
+        real MeshCentral controller from a captive portal / router admin UI,
+        the response body must contain a recognisable marker.
+
+    .PARAMETER MeshCentralMarker
+        Regex tested case-insensitively against the response body. Default
+        '(?i)meshcentral' -- MeshCentral's default login page includes the
+        product name in title, scripts, and copyright notice.
+
+    .OUTPUTS
+        pscustomobject @{ Ok; Status; Url; Reason }
     #>
     [CmdletBinding()]
     param(
@@ -203,21 +215,35 @@ function Test-ControllerEndpoint {
         [int]$Port = 443,
         [string]$ProbePath = '/',
         [int]$TcpTimeoutMs = 750,
-        [int]$HttpTimeoutSec = 4
+        [int]$HttpTimeoutSec = 4,
+        [string]$MeshCentralMarker = '(?i)meshcentral'
     )
     $url = "https://$Address`:$Port$ProbePath"
     $tcpOk = & $script:DiscoveryInvokers.TestTcp $Address $Port $TcpTimeoutMs
     if (-not $tcpOk) {
         return [pscustomobject]@{ Ok = $false; Status = $null; Url = $url; Reason = 'tcp-closed' }
     }
-    $status = & $script:DiscoveryInvokers.HttpProbe $url $HttpTimeoutSec
-    if ($null -eq $status) {
+    $resp = & $script:DiscoveryInvokers.HttpProbe $url $HttpTimeoutSec
+    if ($null -eq $resp) {
         return [pscustomobject]@{ Ok = $false; Status = $null; Url = $url; Reason = 'no-response' }
     }
-    if (Test-ProbeOk $status) {
+    $status = $resp.Status
+    $body   = if ($resp.PSObject.Properties['Body']) { "$($resp.Body)" } else { '' }
+    if (-not (Test-ProbeOk $status)) {
+        return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = "http-$status" }
+    }
+    # 2xx/3xx/401 alone is not enough -- require the MeshCentral marker so a
+    # captive portal or router admin UI on the LAN doesn't false-positive.
+    if ($body -and ($body -match $MeshCentralMarker)) {
         return [pscustomobject]@{ Ok = $true; Status = $status; Url = $url; Reason = 'ok' }
     }
-    return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = "http-$status" }
+    # 401 with no body is allowed -- MeshCentral sometimes returns 401 with
+    # an empty body before redirecting; downstream stages will surface the
+    # real verification (login attempt) anyway.
+    if ($status -eq 401 -and -not $body) {
+        return [pscustomobject]@{ Ok = $true; Status = $status; Url = $url; Reason = 'ok-401-empty' }
+    }
+    return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = "marker-missing" }
 }
 
 function Get-SubnetScanTarget {
@@ -330,7 +356,8 @@ function Find-Controller {
         $cfg = & $script:DiscoveryInvokers.ReadConfig $ConfigPath
         if ($cfg) {
             $addr = $null
-            if ($cfg.PSObject.Properties['controller'] -and $cfg.controller) {
+            if ($cfg.PSObject.Properties['controller'] -and $cfg.controller `
+                -and $cfg.controller.PSObject.Properties['address']) {
                 $addr = "$($cfg.controller.address)"
             }
             if ($addr) {

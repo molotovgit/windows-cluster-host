@@ -6,9 +6,9 @@
     CompanyName       = 'windows-cluster-host'
     Copyright         = '(c) windows-cluster-host. Released under repo license.'
     Description       = 'Multi-strategy MeshCentral controller discovery for the windows-cluster-host setup script.'
-    PowerShellVersion = '5.1'
+    PowerShellVersion = '7.0'
 
-    FunctionsToExport = @('Find-Controller', 'Test-ControllerEndpoint', 'Get-SubnetScanTargets')
+    FunctionsToExport = @('Find-Controller', 'Test-ControllerEndpoint', 'Get-SubnetScanTarget')
     CmdletsToExport   = @()
     VariablesToExport = @()
     AliasesToExport   = @()
