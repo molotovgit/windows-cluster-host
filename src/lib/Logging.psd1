@@ -15,6 +15,8 @@
         'Start-StageLog',
         'Stop-StageLog',
         'Get-OpenStageName',
+        'Set-ClusterLogRedaction',
+        'Get-ClusterLogRedaction',
         'Reset-ClusterLogState'
     )
     CmdletsToExport   = @()
