@@ -66,6 +66,8 @@ function Write-ClusterLogIfAvailable {
 
 function Get-MillisecondsClamped {
     # Cap a millisecond value at $MaxDelayMs and add optional uniform jitter.
+    # MaxDelayMs is a HARD cap -- jitter is re-clamped against it so the
+    # returned value can never exceed the documented ceiling.
     param(
         [Parameter(Mandatory)][double]$Ms,
         [Parameter(Mandatory)][int]$MaxDelayMs,
@@ -74,8 +76,8 @@ function Get-MillisecondsClamped {
     $bound = [math]::Min($Ms, [double]$MaxDelayMs)
     if ($Jitter) {
         # +-25% jitter to spread thundering-herd retries across hosts.
-        $delta = $bound * 0.5 * (Get-Random -Minimum -1.0 -Maximum 1.0)
-        $bound = [math]::Max(0.0, $bound + $delta)
+        $delta = $bound * 0.25 * (Get-Random -Minimum -1.0 -Maximum 1.0)
+        $bound = [math]::Max(0.0, [math]::Min([double]$MaxDelayMs, $bound + $delta))
     }
     return [int][math]::Round($bound)
 }
@@ -129,7 +131,11 @@ function Invoke-WithRetry {
     .PARAMETER RetryableException
         Optional list of exception type names (full or short). If supplied,
         ONLY these exception types trigger a retry; anything else throws
-        immediately.
+        immediately. Matching walks the InnerException chain and is by
+        SIMPLE NAME -- it does NOT match subclasses. e.g. supplying
+        'IOException' will NOT match FileNotFoundException even though the
+        latter derives from the former. List each concrete type you want
+        to retry.
 
     .PARAMETER ShouldRetry
         Optional predicate { param($ErrorRecord, $AttemptNumber) ... } that
@@ -260,7 +266,14 @@ function Invoke-WithFallback {
         if (-not $s.ContainsKey('Name')  -or -not $s.Name)  { throw "Invoke-WithFallback: strategy at index $i missing 'Name'." }
         if (-not $s.ContainsKey('Block') -or -not $s.Block) { throw "Invoke-WithFallback: strategy '$($s.Name)' missing 'Block'." }
 
-        if ($OnAttempt) { & $OnAttempt $s.Name $i | Out-Null }
+        if ($OnAttempt) {
+            try { & $OnAttempt $s.Name $i | Out-Null }
+            catch {
+                Write-ClusterLogIfAvailable -Level Warn -Message "OnAttempt callback threw -- continuing with the strategy" -Data @{
+                    strategy = $s.Name; index = $i; callback_error = $_.Exception.Message
+                }
+            }
+        }
         Write-ClusterLogIfAvailable -Level Info -Message "Trying strategy" -Data @{
             strategy = $s.Name; index = $i; total = $Strategy.Count
         }
@@ -309,9 +322,12 @@ function Invoke-WithFallback {
                     "Invoke-WithFallback: all strategies exhausted ($names).",
                     @($attempts | ForEach-Object { $_.Error.Exception } | Where-Object { $_ })
                 )
-                # Attach the attempts list to the exception's Data dictionary so
-                # callers can inspect per-strategy outcomes.
+                # Attach the attempts list AND the first exception to the
+                # exception's Data dictionary so callers can inspect per-strategy
+                # outcomes and grab the primary failure mode in one property access.
                 $agg.Data['Attempts'] = $attempts.ToArray()
+                $first = $attempts | Where-Object { $_.Error } | Select-Object -First 1
+                if ($first) { $agg.Data['First'] = $first.Error }
                 throw $agg
             }
         }

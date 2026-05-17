@@ -118,6 +118,39 @@ Describe 'Invoke-WithRetry' {
         }
         ($sleeps | Measure-Object -Maximum).Maximum | Should -BeLessOrEqual 5000
     }
+
+    It 'respects -MaxDelayMs as a hard cap even WITH -Jitter applied' {
+        $sleeps = New-Object System.Collections.Generic.List[int]
+        InModuleScope Retry -Parameters @{ caps = $sleeps } {
+            param($caps)
+            Mock Start-Sleep -ModuleName Retry { param($Milliseconds) $caps.Add($Milliseconds) | Out-Null }.GetNewClosure()
+            try {
+                # Many attempts so the dataset is statistically meaningful and
+                # the +-25% jitter has ample opportunity to overshoot if the
+                # math is wrong.
+                Invoke-WithRetry -Name 'cap-jitter' -MaxAttempts 12 -InitialDelayMs 1000 `
+                    -BackoffFactor 10.0 -MaxDelayMs 2000 -Jitter `
+                    -ScriptBlock { throw 'fail' } 6>$null
+            } catch {}
+        }
+        $sleeps.Count | Should -BeGreaterThan 5
+        foreach ($s in $sleeps) { $s | Should -BeLessOrEqual 2000 }
+    }
+
+    It '-RetryableException matches against a deep InnerException chain' {
+        $script:calls = 0
+        try {
+            Invoke-WithRetry -Name 'inner' -MaxAttempts 3 -InitialDelayMs 1 `
+                -RetryableException @('IOException') `
+                -ScriptBlock {
+                    $script:calls++
+                    $inner   = [System.IO.IOException]::new('disk-fault')
+                    $wrapper = [System.InvalidOperationException]::new('wrapped', $inner)
+                    throw $wrapper
+                } 6>$null
+        } catch {}
+        $script:calls | Should -Be 3
+    }
 }
 
 Describe 'Invoke-WithFallback' {
@@ -192,6 +225,27 @@ Describe 'Invoke-WithFallback' {
         $script:seen.Count    | Should -Be 2
         $script:seen[0]       | Should -Be '0:first'
         $script:seen[1]       | Should -Be '1:second'
+    }
+
+    It 'AggregateException.Data[''First''] points at the primary failure mode' {
+        $thrown = $null
+        try {
+            Invoke-WithFallback -Strategy @(
+                @{ Name = 'primary';  Block = { throw [System.Net.WebException]::new('net-down') } }
+                @{ Name = 'fallback'; Block = { throw [System.IO.IOException]::new('disk-fault') } }
+            ) 6>$null
+        } catch { $thrown = $_ }
+        $thrown.Exception.Data['First']           | Should -Not -BeNullOrEmpty
+        $thrown.Exception.Data['First'].Exception | Should -BeOfType ([System.Net.WebException])
+    }
+
+    It '-OnAttempt that throws does NOT abort the fallback chain' {
+        $r = Invoke-WithFallback -Strategy @(
+            @{ Name = 'first';  Block = { throw 'x' } }
+            @{ Name = 'second'; Block = { 'ok' } }
+        ) -OnAttempt { param($name, $idx) throw "callback boom for $name" } 6>$null
+        $r.Winner | Should -Be 'second'
+        $r.Result | Should -Be 'ok'
     }
 
     It 'rejects an empty strategy list' {
