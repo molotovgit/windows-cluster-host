@@ -263,6 +263,7 @@ function Set-ClusterRunVersion {
     )
     if (-not $RegBase) { $RegBase = Get-DefaultRegBase }
     Write-RegValue -Path $RegBase -Name 'Version' -Value $Version
+    Write-ClusterLogIfAvailable -Level Info -Message "Run version stamped" -Data @{ version = $Version }
 }
 
 function Reset-ClusterRunState {
