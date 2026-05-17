@@ -1,0 +1,63 @@
+{
+  "_comment": "Copy to cluster-config.json and edit. The setup script reads this on every host. All fields are optional — if missing, the script falls back to discovery (mDNS) then prompt.",
+
+  "controller": {
+    "_comment": "Where MeshCentral lives. If omitted, script auto-discovers via mDNS / DNS / scan / prompt.",
+    "address": null,
+    "port": 443,
+    "protocol": "https",
+    "device_group": "Fleet-30"
+  },
+
+  "host": {
+    "_comment": "Per-host overrides. If omitted, script auto-derives.",
+    "hostname": null,
+    "vm_storage_path": null,
+    "log_path": "C:\\ProgramData\\ClusterHost\\logs"
+  },
+
+  "vms": {
+    "_comment": "VM fleet on this host. Names are name_prefix + suffix; for count=2 the default suffixes are 'a','b'. Override suffixes for count > 2.",
+    "count": 2,
+    "name_prefix": "vm-",
+    "name_suffixes": null,
+    "min_disk_gb_per_vm": 60,
+    "memory_startup_gb": 4,
+    "memory_min_gb": 2,
+    "memory_max_gb": 6,
+    "vcpu_count": 2,
+    "stagger_seconds": 30,
+    "golden_image_source_preference": ["smb", "https", "local"]
+  },
+
+  "network": {
+    "_comment": "NAT switch for VMs. Picks first available /24 from this list to avoid host network collisions.",
+    "nat_switch_name": "ClusterNATSwitch",
+    "nat_candidate_subnets": [
+      "192.168.100.0/24",
+      "192.168.150.0/24",
+      "172.20.50.0/24",
+      "10.50.0.0/24"
+    ]
+  },
+
+  "wifi": {
+    "_comment": "Optional — only if the script should add a WiFi profile. NEVER store the password in this JSON. Choose one secure source below; the rest must stay null. If WiFi is already configured on the host, leave the whole block as null. Precedence (first non-null wins): wlanprofile_xml_path -> credential_manager_target -> dpapi_blob_path -> password (only if allow_plaintext_password=true).",
+    "ssid": null,
+    "password": null,
+    "_password_warning": "If you set 'password' here, the script will refuse to run unless 'allow_plaintext_password' is also set true. Prefer credential_manager_target.",
+    "allow_plaintext_password": false,
+    "credential_manager_target": null,
+    "dpapi_blob_path": null,
+    "wlanprofile_xml_path": null
+  },
+
+  "advanced": {
+    "_comment": "Tweakables most operators won't touch.",
+    "skip_bios_check": false,
+    "skip_hyperv_install": false,
+    "skip_vm_deploy": false,
+    "force_reinstall_meshagent": false,
+    "log_level": "Info"
+  }
+}

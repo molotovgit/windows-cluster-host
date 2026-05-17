@@ -24,6 +24,7 @@ logs/
 *.pem
 *.pfx
 config.local.json
+config/cluster-config.json
 secrets.json
 wifi-credentials.xml
 .env
