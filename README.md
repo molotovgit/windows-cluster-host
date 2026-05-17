@@ -33,7 +33,31 @@ This repo is **half of a pair**. The companion repo, [`windows-cluster-controlle
 
 ## Status
 
-🚧 In active development. Setup scripts coming soon.
+🚧 In active development.
+
+Repo layout:
+
+```
+├── src/
+│   ├── lib/         # Reusable PowerShell modules (logging, state, retry, …)
+│   ├── stages/      # The 8 setup stages, each a self-contained .ps1
+│   └── Invoke-ClusterHostSetup.ps1   # Top-level orchestrator (built in PR 16)
+├── config/
+│   └── cluster-config.example.json
+├── scripts/         # Operator helpers (preflight, uninstall, repair)
+├── tests/
+│   ├── unit/        # Pester unit tests with mocked external cmdlets
+│   ├── integration/ # End-to-end dry-run with all I/O mocked
+│   └── fixtures/    # Mock data for tests
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── TROUBLESHOOTING.md
+│   └── REVIEW_PROCESS.md
+├── REVIEW_PROMPT.md # Reviewer brief used by the peer-review subagent
+└── install.ps1      # One-liner bootstrap (PR 17)
+```
+
+Every change is reviewed by an independent Claude subagent against `REVIEW_PROMPT.md` before merge — see [docs/REVIEW_PROCESS.md](docs/REVIEW_PROCESS.md).
 
 ## Cost
 

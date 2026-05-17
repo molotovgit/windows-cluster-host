@@ -1,0 +1,20 @@
+# Treat all text as auto so checkouts match the host platform's line endings,
+# but pin PowerShell files to LF in the repo to keep diffs clean and Pester happy.
+* text=auto
+*.ps1   text eol=lf
+*.psm1  text eol=lf
+*.psd1  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# Binary blobs — never touched
+*.vhdx  binary
+*.vhd   binary
+*.iso   binary
+*.exe   binary
+*.msi   binary
+*.zip   binary
+*.png   binary
+*.jpg   binary

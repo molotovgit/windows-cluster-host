@@ -1,0 +1,55 @@
+{
+  "_comment": "Copy to cluster-config.json and edit. The setup script reads this on every host. All fields are optional — if missing, the script falls back to discovery (mDNS) then prompt.",
+
+  "controller": {
+    "_comment": "Where MeshCentral lives. If omitted, script auto-discovers via mDNS / DNS / scan / prompt.",
+    "address": null,
+    "port": 443,
+    "protocol": "https",
+    "device_group": "Fleet-30"
+  },
+
+  "host": {
+    "_comment": "Per-host overrides. If omitted, script auto-derives.",
+    "hostname": null,
+    "vm_storage_path": null,
+    "log_path": "C:\\ProgramData\\ClusterHost\\logs"
+  },
+
+  "vms": {
+    "_comment": "How many VMs to create on this host. Default 2. Each gets vm-a, vm-b naming.",
+    "count": 2,
+    "memory_startup_gb": 4,
+    "memory_min_gb": 2,
+    "memory_max_gb": 6,
+    "vcpu_count": 2,
+    "stagger_seconds": 30,
+    "golden_image_source_preference": ["smb", "https", "local"]
+  },
+
+  "network": {
+    "_comment": "NAT switch for VMs. Picks first available /24 from this list to avoid host network collisions.",
+    "nat_switch_name": "ClusterNATSwitch",
+    "nat_candidate_subnets": [
+      "192.168.100.0/24",
+      "192.168.150.0/24",
+      "172.20.50.0/24",
+      "10.50.0.0/24"
+    ]
+  },
+
+  "wifi": {
+    "_comment": "Optional — only if you want the script to add a WiFi profile. If WiFi already configured on host, leave null.",
+    "ssid": null,
+    "password": null
+  },
+
+  "advanced": {
+    "_comment": "Tweakables most operators won't touch.",
+    "skip_bios_check": false,
+    "skip_hyperv_install": false,
+    "skip_vm_deploy": false,
+    "force_reinstall_meshagent": false,
+    "log_level": "Info"
+  }
+}
