@@ -17,8 +17,11 @@
   },
 
   "vms": {
-    "_comment": "How many VMs to create on this host. Default 2. Each gets vm-a, vm-b naming.",
+    "_comment": "VM fleet on this host. Names are name_prefix + suffix; for count=2 the default suffixes are 'a','b'. Override suffixes for count > 2.",
     "count": 2,
+    "name_prefix": "vm-",
+    "name_suffixes": null,
+    "min_disk_gb_per_vm": 60,
     "memory_startup_gb": 4,
     "memory_min_gb": 2,
     "memory_max_gb": 6,
@@ -39,9 +42,14 @@
   },
 
   "wifi": {
-    "_comment": "Optional — only if you want the script to add a WiFi profile. If WiFi already configured on host, leave null.",
+    "_comment": "Optional — only if the script should add a WiFi profile. NEVER store the password in this JSON. Choose one secure source below; the rest must stay null. If WiFi is already configured on the host, leave the whole block as null.",
     "ssid": null,
-    "password": null
+    "password": null,
+    "_password_warning": "If you set 'password' here, the script will refuse to run unless 'allow_plaintext_password' is also set true. Prefer credential_manager_target.",
+    "allow_plaintext_password": false,
+    "credential_manager_target": null,
+    "dpapi_blob_path": null,
+    "wlanprofile_xml_path": null
   },
 
   "advanced": {

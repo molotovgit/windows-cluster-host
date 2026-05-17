@@ -70,7 +70,7 @@ The script tries each subnet from `network.nat_candidate_subnets`. If all collid
 
 1. Check existing routes: `Get-NetRoute`
 2. Add a new candidate subnet to `cluster-config.json` that doesn't collide
-3. Re-run only the network stage: `.\src\Invoke-ClusterHostSetup.ps1 -StartFromStage 4`
+3. Re-run only the network stage: `.\src\Invoke-ClusterHostSetup.ps1 -StartFromStage 5`
 
 ### "VMs can't reach controller"
 
@@ -88,7 +88,7 @@ The NAT should be configured for the subnet the VMs are on. If missing, run netw
 ### "MeshAgent install succeeded but host not in MeshCentral console"
 
 - Wait 30 seconds — agent registration is async
-- Check agent service: `Get-Service Mesh Agent`
+- Check agent service: `Get-Service -Name 'Mesh Agent'`
 - Check agent log: `C:\Program Files\Mesh Agent\meshagent.log`
 - Verify controller URL in `cluster-config.json` is reachable from the host
 
