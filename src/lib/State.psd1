@@ -12,9 +12,10 @@
         'Save-StageMarker', 'Get-StageMarker', 'Clear-StageMarker',
         'Set-ClusterRunStatus', 'Get-ClusterRunStatus',
         'Set-ClusterRunVersion', 'Reset-ClusterRunState',
+        'Complete-ClusterRun',
         'Get-ResumeTaskInfo', 'Test-ResumeTask',
         'Register-ResumeTask', 'Unregister-ResumeTask',
-        'New-ResumeTaskSpec', 'Set-ResumeTaskInvoker', 'Reset-ResumeTaskInvoker'
+        'New-ResumeTaskSpec'
     )
     CmdletsToExport   = @()
     VariablesToExport = @()

@@ -36,6 +36,35 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Soft dependency on Logging.psm1: imported on first use; never blocks the
+# module from loading when the sibling module is absent (so unit tests for
+# State don't have to require Logging). The Write-ClusterLogIfAvailable
+# helper below quietly no-ops if the Logging module isn't loaded.
+
+function Write-ClusterLogIfAvailable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Level,
+        [Parameter(Mandatory)][string]$Message,
+        [hashtable]$Data
+    )
+    $cmd = Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        # Try to import the sibling Logging module from the same lib/ folder.
+        $sibling = Join-Path $PSScriptRoot 'Logging.psm1'
+        if (Test-Path -LiteralPath $sibling) {
+            Import-Module -Name $sibling -Force -ErrorAction SilentlyContinue
+            $cmd = Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue
+        }
+    }
+    if (-not $cmd) { return }  # logging unavailable, swallow silently
+    if ($Data) {
+        & $cmd -Level $Level -Message $Message -Stage 'state' -Data $Data
+    } else {
+        & $cmd -Level $Level -Message $Message -Stage 'state'
+    }
+}
+
 # ---------- helpers ----------
 
 function Get-DefaultRegBase {
@@ -70,7 +99,11 @@ function Write-RegValue {
     )
     Confirm-RegBase -Path $Path
     if ($null -eq $Value) {
-        if (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue) {
+        # Get-ItemProperty -Name returns the parent key object even when the
+        # property is missing on some PS versions, so we cannot rely on its
+        # truthiness. Probe the property collection explicitly.
+        $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if ($item -and ($item.GetValueNames() -contains $Name)) {
             Remove-ItemProperty -LiteralPath $Path -Name $Name -Force
         }
         return
@@ -117,13 +150,20 @@ function Save-StageMarker {
     if (-not $RegBase) { $RegBase = Get-DefaultRegBase }
     Confirm-RegBase -Path $RegBase
 
+    # Order matters for crash recovery: write RunId + Status first so the
+    # registry is in a consistent state if we die mid-init, and write
+    # StartedAt LAST. The presence of StartedAt is the durable signal that
+    # the init block completed; a re-run after a crash will re-do the init
+    # values (idempotent overwrite for RunId is fine -- diagnostics only).
     if (-not (Get-RegValue -Path $RegBase -Name 'StartedAt')) {
         Write-RegValue -Path $RegBase -Name 'RunId'     -Value ([guid]::NewGuid().ToString())
-        Write-RegValue -Path $RegBase -Name 'StartedAt' -Value (Get-NowIso)
         Write-RegValue -Path $RegBase -Name 'Status'    -Value 'InProgress'
+        Write-RegValue -Path $RegBase -Name 'StartedAt' -Value (Get-NowIso)
+        Write-ClusterLogIfAvailable -Level Info -Message "Run started" -Data @{ stage = $StageNumber; regBase = $RegBase }
     }
     Write-RegValue -Path $RegBase -Name 'Stage'     -Value $StageNumber -Type DWord
     Write-RegValue -Path $RegBase -Name 'UpdatedAt' -Value (Get-NowIso)
+    Write-ClusterLogIfAvailable -Level Info -Message "Stage marker advanced" -Data @{ stage = $StageNumber }
 }
 
 function Get-StageMarker {
@@ -181,6 +221,10 @@ function Set-ClusterRunStatus {
     Write-RegValue -Path $RegBase -Name 'UpdatedAt' -Value (Get-NowIso)
     if ($PSBoundParameters.ContainsKey('LastError')) {
         Write-RegValue -Path $RegBase -Name 'LastError' -Value $LastError
+    }
+    Write-ClusterLogIfAvailable -Level Info -Message "Run status updated" -Data @{
+        status    = $Status
+        lastError = if ($PSBoundParameters.ContainsKey('LastError')) { $LastError } else { '<unchanged>' }
     }
 }
 
@@ -243,26 +287,42 @@ function Reset-ClusterRunState {
 
 # Resume-task constants. Public read-only via Get-ResumeTaskInfo.
 $script:ResumeTaskName    = 'ClusterHostResume'
-$script:ResumeTaskFolder  = '\'        # root task folder
+$script:ResumeTaskFolder  = '\ClusterHost\'   # dedicated folder to avoid name collisions
+
+function Get-DefaultResumeTaskInvoker {
+    @{
+        Test       = { Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction SilentlyContinue }
+        Register   = {
+            param($Spec)
+            $action  = New-ScheduledTaskAction      -Execute  $Spec.Execute -Argument $Spec.Argument
+            $triggers = @()
+            if ($Spec.Trigger -in 'AtLogOn','Both')   { $triggers += (New-ScheduledTaskTrigger -AtLogOn -User $Spec.User) }
+            if ($Spec.Trigger -in 'AtStartup','Both') { $triggers += (New-ScheduledTaskTrigger -AtStartup) }
+            $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                                                    -StartWhenAvailable -RestartCount 3 `
+                                                    -RestartInterval (New-TimeSpan -Minutes 5)
+            # AtStartup requires the task to be able to run without an
+            # interactive user logged in; use ServiceAccount (SYSTEM) when
+            # any AtStartup trigger is in play, otherwise Interactive.
+            $logonType = if ($Spec.Trigger -in 'AtStartup','Both') { 'ServiceAccount' } else { 'Interactive' }
+            $userId    = if ($logonType -eq 'ServiceAccount') { 'NT AUTHORITY\SYSTEM' } else { $Spec.User }
+            $princ   = New-ScheduledTaskPrincipal   -UserId $userId -LogonType $logonType -RunLevel Highest
+            Register-ScheduledTask -TaskName $Spec.TaskName -TaskPath $Spec.TaskPath `
+                                   -Action $action -Trigger $triggers -Settings $set -Principal $princ | Out-Null
+        }
+        Unregister = { Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false }
+    }
+}
 
 # Pluggable invokers for the scheduled-task surface. Defaults call the real
-# Windows cmdlets in production; unit tests swap them with closures that
-# record calls without performing them. This is the simplest mock seam that
-# also bypasses the real cmdlets' strict CimInstance parameter binding.
-$script:ResumeTaskInvokers = @{
-    Test       = { Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction SilentlyContinue }
-    Register   = {
-        param($Spec)
-        $action  = New-ScheduledTaskAction      -Execute  $Spec.Execute  -Argument $Spec.Argument
-        $trigger = New-ScheduledTaskTrigger     -AtLogOn  -User    $Spec.User
-        $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                                                -StartWhenAvailable -RestartCount 3 `
-                                                -RestartInterval (New-TimeSpan -Minutes 5)
-        $princ   = New-ScheduledTaskPrincipal   -UserId   $Spec.User -LogonType Interactive -RunLevel Highest
-        Register-ScheduledTask -TaskName $Spec.TaskName -TaskPath $Spec.TaskPath `
-                               -Action $action -Trigger $trigger -Settings $set -Principal $princ | Out-Null
+# Windows cmdlets in production; unit tests swap them with closures via
+# Set-ResumeTaskInvoker, which is gated by CLUSTERHOST_ALLOW_TEST_SEAMS.
+$script:ResumeTaskInvokers = Get-DefaultResumeTaskInvoker
+
+function Confirm-TestSeamAllowed {
+    if (-not $env:CLUSTERHOST_ALLOW_TEST_SEAMS) {
+        throw "Test seams are disabled in production. Set `$env:CLUSTERHOST_ALLOW_TEST_SEAMS=1 to enable Set-ResumeTaskInvoker / Reset-ResumeTaskInvoker."
     }
-    Unregister = { Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false }
 }
 
 function Set-ResumeTaskInvoker {
@@ -270,14 +330,14 @@ function Set-ResumeTaskInvoker {
     .SYNOPSIS
         Test-only: override one of the scheduled-task invocation closures so
         unit tests can stub the cmdlets without triggering Windows' strict
-        CimInstance parameter binding.
+        CimInstance parameter binding. Gated by CLUSTERHOST_ALLOW_TEST_SEAMS.
 
     .PARAMETER Operation
         Test | Register | Unregister
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
-        Justification = 'Test seam; mutates only an in-process script-scope hashtable.')]
+        Justification = 'Test seam gated by env var; mutates only an in-process script-scope hashtable.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -285,41 +345,36 @@ function Set-ResumeTaskInvoker {
         [string]$Operation,
         [Parameter(Mandatory)][scriptblock]$ScriptBlock
     )
+    Confirm-TestSeamAllowed
     $script:ResumeTaskInvokers[$Operation] = $ScriptBlock
 }
 
 function Reset-ResumeTaskInvoker {
     <#
-    .SYNOPSIS Test-only: restore the real-cmdlet invokers.
+    .SYNOPSIS Test-only: restore the real-cmdlet invokers. Gated by CLUSTERHOST_ALLOW_TEST_SEAMS.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
-        Justification = 'Test seam; restores in-process script-scope hashtable.')]
+        Justification = 'Test seam gated by env var; restores in-process script-scope hashtable.')]
     [CmdletBinding()]
     param()
-    $script:ResumeTaskInvokers = @{
-        Test       = { Get-ScheduledTask -TaskName $script:ResumeTaskName -ErrorAction SilentlyContinue }
-        Register   = {
-            param($Spec)
-            $action  = New-ScheduledTaskAction      -Execute  $Spec.Execute  -Argument $Spec.Argument
-            $trigger = New-ScheduledTaskTrigger     -AtLogOn  -User    $Spec.User
-            $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                                                    -StartWhenAvailable -RestartCount 3 `
-                                                    -RestartInterval (New-TimeSpan -Minutes 5)
-            $princ   = New-ScheduledTaskPrincipal   -UserId   $Spec.User -LogonType Interactive -RunLevel Highest
-            Register-ScheduledTask -TaskName $Spec.TaskName -TaskPath $Spec.TaskPath `
-                                   -Action $action -Trigger $trigger -Settings $set -Principal $princ | Out-Null
-        }
-        Unregister = { Unregister-ScheduledTask -TaskName $script:ResumeTaskName -Confirm:$false }
-    }
+    Confirm-TestSeamAllowed
+    $script:ResumeTaskInvokers = Get-DefaultResumeTaskInvoker
 }
 
 function New-ResumeTaskSpec {
     <#
     .SYNOPSIS
         Pure function: build the spec for the resume scheduled task. Returns
-        a hashtable with TaskName, TaskPath, Execute, Argument, User. Easily
-        unit-testable.
+        a hashtable with TaskName, TaskPath, Execute, Argument, User, Trigger.
+
+    .PARAMETER Trigger
+        AtLogOn  -- fires when the configured user logs on. Requires either
+                    auto-logon or human at the keyboard.
+        AtStartup -- fires when Windows boots, before any user logs on.
+                     Runs as NT AUTHORITY\SYSTEM. Safe for unattended hosts.
+        Both     -- registers both triggers (default). Whichever happens
+                     first re-launches the orchestrator with -Resume.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
@@ -329,7 +384,10 @@ function New-ResumeTaskSpec {
         [Parameter(Mandatory)][string]$OrchestratorPath,
         [string]$PwshPath,
         [string]$User,
-        [string[]]$ExtraArgs = @()
+        [string[]]$ExtraArgs = @(),
+
+        [ValidateSet('AtLogOn','AtStartup','Both')]
+        [string]$Trigger = 'Both'
     )
 
     if (-not (Test-Path -LiteralPath $OrchestratorPath)) {
@@ -352,6 +410,7 @@ function New-ResumeTaskSpec {
         Execute  = $PwshPath
         Argument = ($argList -join ' ')
         User     = $User
+        Trigger  = $Trigger
     }
 }
 
@@ -376,11 +435,25 @@ function Test-ResumeTask {
     return [bool](& $script:ResumeTaskInvokers.Test)
 }
 
+function Confirm-TaskSchedulerAvailable {
+    # The Schedule service must be Running for Register-ScheduledTask to succeed.
+    # Skip the check when test seams are active so unit tests don't have to
+    # mock the service surface.
+    if ($env:CLUSTERHOST_ALLOW_TEST_SEAMS) { return }
+    $svc = Get-Service -Name 'Schedule' -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        throw "Register-ResumeTask: Task Scheduler service ('Schedule') is not installed -- this host is not a supported Windows SKU."
+    }
+    if ($svc.Status -ne 'Running') {
+        throw "Register-ResumeTask: Task Scheduler service is '$($svc.Status)'. Run 'Set-Service Schedule -StartupType Automatic; Start-Service Schedule' and retry."
+    }
+}
+
 function Register-ResumeTask {
     <#
     .SYNOPSIS
-        Register (or replace) a scheduled task that runs the orchestrator at
-        next user logon with the -Resume switch.
+        Register (or replace) a scheduled task that runs the orchestrator
+        with -Resume after the next reboot.
 
     .PARAMETER OrchestratorPath
         Absolute path to Invoke-ClusterHostSetup.ps1 (PR 16).
@@ -389,10 +462,17 @@ function Register-ResumeTask {
         pwsh.exe path. Defaults to 'pwsh.exe' on PS7 or 'powershell.exe' on PS5.1.
 
     .PARAMETER User
-        Logon user the task runs as. Defaults to the current user.
+        Logon user the task runs as when the AtLogOn trigger fires. Defaults
+        to the current user. Ignored if -Trigger is AtStartup only (task
+        runs as NT AUTHORITY\SYSTEM in that case).
 
     .PARAMETER ExtraArgs
         Additional arguments appended after -Resume.
+
+    .PARAMETER Trigger
+        AtLogOn | AtStartup | Both (default Both). AtStartup is the safe
+        choice for unattended setups -- it fires before any user logs on
+        and runs as SYSTEM. Pair it with AtLogOn for belt-and-braces.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSUseShouldProcessForStateChangingFunctions', '',
@@ -402,14 +482,24 @@ function Register-ResumeTask {
         [Parameter(Mandatory)][string]$OrchestratorPath,
         [string]$PwshPath,
         [string]$User,
-        [string[]]$ExtraArgs = @()
+        [string[]]$ExtraArgs = @(),
+
+        [ValidateSet('AtLogOn','AtStartup','Both')]
+        [string]$Trigger = 'Both'
     )
 
-    $spec = New-ResumeTaskSpec -OrchestratorPath $OrchestratorPath -PwshPath $PwshPath -User $User -ExtraArgs $ExtraArgs
+    Confirm-TaskSchedulerAvailable
 
-    # Idempotent: remove any prior copy first so we always end with the new spec.
+    $spec = New-ResumeTaskSpec -OrchestratorPath $OrchestratorPath -PwshPath $PwshPath -User $User `
+                               -ExtraArgs $ExtraArgs -Trigger $Trigger
+
     if (Test-ResumeTask) { & $script:ResumeTaskInvokers.Unregister }
     & $script:ResumeTaskInvokers.Register $spec
+    Write-ClusterLogIfAvailable -Level Info -Message "Resume task registered" -Data @{
+        taskName = $spec.TaskName
+        trigger  = $spec.Trigger
+        argument = $spec.Argument
+    }
     return $spec
 }
 
@@ -422,11 +512,44 @@ function Unregister-ResumeTask {
         Justification = 'Removes a dedicated scheduled task; ShouldProcess prompts would break unattended teardown.')]
     [CmdletBinding()]
     param()
-    if (Test-ResumeTask) { & $script:ResumeTaskInvokers.Unregister }
+    if (Test-ResumeTask) {
+        & $script:ResumeTaskInvokers.Unregister
+        Write-ClusterLogIfAvailable -Level Info -Message "Resume task unregistered"
+    }
+}
+
+function Complete-ClusterRun {
+    <#
+    .SYNOPSIS
+        Mark the run as Completed AND clean up reboot-resume scaffolding.
+        Call this from the orchestrator after the final stage succeeds.
+
+        Specifically:
+          1. Sets Status=Completed (records UpdatedAt).
+          2. Clears the stage marker so a future fresh run starts at Stage 1.
+          3. Unregisters the ClusterHostResume scheduled task so it cannot
+             accidentally fire on the next reboot and re-execute the
+             orchestrator on an already-configured host.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Finalises the run by writing Completed status, clearing the stage marker, and unregistering the resume task. Intended to run unattended.')]
+    [CmdletBinding()]
+    param([string]$RegBase)
+    if (-not $RegBase) { $RegBase = Get-DefaultRegBase }
+    Set-ClusterRunStatus -Status Completed -RegBase $RegBase
+    Clear-StageMarker -RegBase $RegBase
+    Unregister-ResumeTask
+    Write-ClusterLogIfAvailable -Level Info -Message "Cluster run completed and resume task removed"
 }
 
 Export-ModuleMember -Function `
     Save-StageMarker, Get-StageMarker, Clear-StageMarker, `
     Set-ClusterRunStatus, Get-ClusterRunStatus, Set-ClusterRunVersion, Reset-ClusterRunState, `
+    Complete-ClusterRun, `
     Get-ResumeTaskInfo, Test-ResumeTask, Register-ResumeTask, Unregister-ResumeTask, `
-    New-ResumeTaskSpec, Set-ResumeTaskInvoker, Reset-ResumeTaskInvoker
+    New-ResumeTaskSpec
+
+# Test seams are intentionally NOT exported. Unit tests reach them via:
+#   & (Get-Module State) { Set-ResumeTaskInvoker -Operation X -ScriptBlock {...} }
+# AND must set $env:CLUSTERHOST_ALLOW_TEST_SEAMS=1 before the call.
