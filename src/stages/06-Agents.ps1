@@ -80,7 +80,7 @@ function Get-DefaultAgentsInvoker {
                 $existing = @(Get-Content -LiteralPath $Path -Encoding utf8)
             }
             $line = $Key.Trim()
-            $hasIt = ($existing | Where-Object { $_.Trim() -eq $line }).Count -gt 0
+            $hasIt = @($existing | Where-Object { $_.Trim() -eq $line }).Count -gt 0
             if (-not $hasIt) {
                 $combined = @($existing | Where-Object { $_.Trim() }) + @($line)
                 [System.IO.File]::WriteAllLines($Path, $combined, [System.Text.UTF8Encoding]::new($false))
@@ -91,9 +91,15 @@ function Get-DefaultAgentsInvoker {
             param([string]$Path)
             try {
                 $acl = Get-Acl -Path $Path
-                $acl.SetAccessRuleProtection($true, $false)  # disable inheritance, drop inherited rules
-                # Reset to SYSTEM:F + BUILTIN\Administrators:F only.
-                $acl.Access | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
+                # Disable inheritance AND drop inherited rules from the in-memory ACL.
+                # The second-arg $false copies-then-doesn't-preserve, so inherited
+                # entries are removed by the call itself.
+                $acl.SetAccessRuleProtection($true, $false)
+                # Snapshot before mutation to avoid enumerate-while-modify, and only
+                # touch explicit (non-inherited) rules -- inherited ones were already
+                # dropped by SetAccessRuleProtection above.
+                $snapshot = @($acl.Access | Where-Object { -not $_.IsInherited })
+                foreach ($rule in $snapshot) { [void]$acl.RemoveAccessRule($rule) }
                 $sys   = New-Object System.Security.AccessControl.FileSystemAccessRule('NT AUTHORITY\SYSTEM','FullControl','Allow')
                 $admin = New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators','FullControl','Allow')
                 $acl.AddAccessRule($sys); $acl.AddAccessRule($admin)
@@ -241,6 +247,7 @@ function Invoke-AgentsStage {
         Add-AgentStep $steps 'Authorized key deployment' 'Warn' 'No -SshAuthorizedKey or Config.ssh.admin_public_key supplied; skipped.' 'Pass -SshAuthorizedKey ''ssh-ed25519 AAAA...'' or set Config.ssh.admin_public_key.'
     } elseif ($DryRun) {
         Add-AgentStep $steps 'Authorized key deployment' 'Skipped' "DryRun: would write key to $AuthorizedKeyPath."
+        Add-AgentStep $steps 'Authorized key ACL' 'Skipped' "DryRun: would harden ACL on $AuthorizedKeyPath to SYSTEM:F + BUILTIN\Administrators:F, no inheritance."
     } else {
         $w = & $script:AgentsInvokers.WriteSshAuthorizedKey $AuthorizedKeyPath $SshAuthorizedKey
         $verb = if ($w.AlreadyPresent) { 'already present' } else { 'appended' }
@@ -277,7 +284,9 @@ function Invoke-AgentsStage {
         } else {
             $d = & $script:AgentsInvokers.DownloadMeshAgent $MeshAgentSmbPath $MeshAgentHttpsUrl $MeshAgentDestination
             if (-not $d.Ok) {
-                Add-AgentStep $steps 'MeshAgent download' 'Fail' $d.Detail "Verify the controller is reachable at $($MeshAgentSmbPath -or '<none>') or $($MeshAgentHttpsUrl -or '<none>')."
+                $smbDisplay   = if ($MeshAgentSmbPath)  { $MeshAgentSmbPath }  else { '<none>' }
+                $httpsDisplay = if ($MeshAgentHttpsUrl) { $MeshAgentHttpsUrl } else { '<none>' }
+                Add-AgentStep $steps 'MeshAgent download' 'Fail' $d.Detail "Verify the controller is reachable at $smbDisplay or $httpsDisplay."
             } else {
                 Add-AgentStep $steps 'MeshAgent download' 'Pass' "Downloaded (source=$($d.Source)). $($d.Detail)"
                 $v = & $script:AgentsInvokers.VerifyMeshAgentHash $MeshAgentDestination $MeshAgentSha256

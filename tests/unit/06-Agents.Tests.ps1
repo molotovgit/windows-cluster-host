@@ -164,6 +164,71 @@ Describe 'Invoke-AgentsStage' {
     }
 }
 
+Describe 'HardenAuthorizedKeyAcl (real ACL on a temp file)' {
+
+    AfterEach { Reset-AgentsInvoker }
+
+    It 'sets exactly SYSTEM and BUILTIN\Administrators FullControl with inheritance off' {
+        # Use the DEFAULT (real) HardenAuthorizedKeyAcl invoker -- this is the
+        # only place we exercise real Windows ACL semantics.
+        Reset-AgentsInvoker
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("agents-acl-" + [guid]::NewGuid().ToString('N').Substring(0,8) + '.tmp')
+        Set-Content -LiteralPath $tmp -Value 'placeholder' -Encoding utf8
+
+        try {
+            # Verify the file starts with inheritance ON (default for a freshly-created file under TEMP).
+            $before = Get-Acl -Path $tmp
+            $before.AreAccessRulesProtected | Should -BeFalse
+
+            # Reach the default invoker and run it.
+            $invoker = (Get-Variable -Name AgentsInvokers -ValueOnly)['HardenAuthorizedKeyAcl']
+            $r = & $invoker $tmp
+            $r.Ok | Should -BeTrue
+
+            $after = Get-Acl -Path $tmp
+            $after.AreAccessRulesProtected | Should -BeTrue
+            # Only SYSTEM and BUILTIN\Administrators should remain.
+            $identities = @($after.Access | ForEach-Object { "$($_.IdentityReference)" })
+            $identities | Should -Contain 'NT AUTHORITY\SYSTEM'
+            $identities | Should -Contain 'BUILTIN\Administrators'
+            foreach ($id in $identities) {
+                $id | Should -BeIn @('NT AUTHORITY\SYSTEM','BUILTIN\Administrators')
+            }
+            # Every remaining ACE must be FullControl.
+            foreach ($ace in $after.Access) {
+                "$($ace.FileSystemRights)" | Should -Match 'FullControl'
+            }
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'WriteSshAuthorizedKey idempotency (real file)' {
+
+    AfterEach { Reset-AgentsInvoker }
+
+    It 'is idempotent: second call with the same key does not duplicate the line' {
+        Reset-AgentsInvoker
+        $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("agents-keys-" + [guid]::NewGuid().ToString('N').Substring(0,8) + '.tmp')
+        $key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY admin@cluster'
+
+        try {
+            $invoker = (Get-Variable -Name AgentsInvokers -ValueOnly)['WriteSshAuthorizedKey']
+            $r1 = & $invoker $tmp $key
+            $r2 = & $invoker $tmp $key
+            $r1.Ok             | Should -BeTrue
+            $r1.AlreadyPresent | Should -BeFalse
+            $r2.Ok             | Should -BeTrue
+            $r2.AlreadyPresent | Should -BeTrue
+            $content = Get-Content -LiteralPath $tmp -Encoding utf8
+            @($content | Where-Object { $_.Trim() -eq $key }).Count | Should -Be 1
+        } finally {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 Describe 'Test seam gating' {
     It 'Set-AgentsInvoker refuses to run without CLUSTERHOST_ALLOW_TEST_SEAMS' {
         Remove-Item Env:CLUSTERHOST_ALLOW_TEST_SEAMS -ErrorAction SilentlyContinue
