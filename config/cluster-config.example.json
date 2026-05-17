@@ -42,7 +42,7 @@
   },
 
   "wifi": {
-    "_comment": "Optional — only if the script should add a WiFi profile. NEVER store the password in this JSON. Choose one secure source below; the rest must stay null. If WiFi is already configured on the host, leave the whole block as null.",
+    "_comment": "Optional — only if the script should add a WiFi profile. NEVER store the password in this JSON. Choose one secure source below; the rest must stay null. If WiFi is already configured on the host, leave the whole block as null. Precedence (first non-null wins): wlanprofile_xml_path -> credential_manager_target -> dpapi_blob_path -> password (only if allow_plaintext_password=true).",
     "ssid": null,
     "password": null,
     "_password_warning": "If you set 'password' here, the script will refuse to run unless 'allow_plaintext_password' is also set true. Prefer credential_manager_target.",

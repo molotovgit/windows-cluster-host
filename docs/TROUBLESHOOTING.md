@@ -143,8 +143,16 @@ Remove-Item 'HKLM:\Software\ClusterHost' -Recurse -Force
 # Remove resume scheduled task
 Unregister-ScheduledTask -TaskName 'ClusterHostResume' -Confirm:$false
 
-# Optionally remove VMs (DANGER — destroys all VMs created by script)
-Get-VM | Where-Object Name -in @('vm-a','vm-b') | ForEach-Object {
+# Optionally remove VMs (DANGER — destroys all VMs created by script).
+# Derive the names from cluster-config.json so this works with non-default vms.name_prefix / vms.count.
+$cfg    = Get-Content 'C:\ProgramData\ClusterHost\config\cluster-config.json' -Raw | ConvertFrom-Json
+$prefix = if ($cfg.vms.name_prefix) { $cfg.vms.name_prefix } else { 'vm-' }
+$names  = if ($cfg.vms.name_suffixes) {
+    $cfg.vms.name_suffixes | ForEach-Object { "$prefix$_" }
+} else {
+    @('a','b') | ForEach-Object { "$prefix$_" }   # default for count=2
+}
+Get-VM | Where-Object { $names -contains $_.Name } | ForEach-Object {
     Stop-VM $_ -TurnOff -Force -ErrorAction SilentlyContinue
     Remove-VM $_ -Force
 }

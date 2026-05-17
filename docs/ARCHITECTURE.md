@@ -69,7 +69,7 @@ Hyper-V install requires a reboot. The script handles this by:
 
 The script never assumes:
 - Controller IP / hostname (discovers via config → mDNS → scan → prompt)
-- VM storage path (picks largest drive with at least `vms.count × 60 GB` free — default 120 GB for 2 VMs)
+- VM storage path (picks largest drive with at least `vms.count × vms.min_disk_gb_per_vm` free — default 120 GB for 2 VMs at 60 GB each)
 - WiFi adapter name (uses any active wireless interface)
 - NAT subnet (picks first from candidate list that doesn't collide with existing routes)
 - Hostname (uses existing or operator-provided)
