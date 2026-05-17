@@ -1,0 +1,53 @@
+# Build artifacts
+*.exe
+*.msi
+*.zip
+build/
+dist/
+bin/
+obj/
+
+# VHDX / VM disk files (large + not for git)
+*.vhdx
+*.vhd
+*.iso
+*.vmdk
+VMs/
+ISOs/
+
+# Logs
+*.log
+logs/
+
+# Secrets & local config (NEVER COMMIT)
+*.key
+*.pem
+*.pfx
+config.local.json
+secrets.json
+wifi-credentials.xml
+.env
+.env.*
+
+# MeshAgent generated files
+MeshAgent/
+meshagent.db
+*.msh
+
+# IDE / OS
+.vscode/
+.idea/
+.vs/
+*.suo
+*.user
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# PowerShell
+*.ps1.bak
+
+# Temp
+*.tmp
+*.bak
+~$*
