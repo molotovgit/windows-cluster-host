@@ -33,25 +33,33 @@ function Get-DefaultVmInvoker {
     @{
         SourceGoldenVhdx = {
             param([string]$SmbPath,[string]$HttpsUrl,[string]$LocalPath,[string]$Destination)
+            # Accumulate per-source failures so the final Detail explains each
+            # path the stage tried (helps the operator diagnose without a re-run).
+            $errs = New-Object System.Collections.Generic.List[string]
             if ($LocalPath -and (Test-Path -LiteralPath $LocalPath)) {
                 try {
                     Copy-Item -LiteralPath $LocalPath -Destination $Destination -Force -ErrorAction Stop
                     return @{ Ok = $true; Source = 'local'; Detail = "Copied from $LocalPath." }
-                } catch { $null = $_ }
+                } catch { $errs.Add("local-copy: $($_.Exception.Message)") }
+            } elseif ($LocalPath) {
+                $errs.Add("local: path '$LocalPath' does not exist")
             }
             if ($SmbPath -and (Test-Path -LiteralPath $SmbPath)) {
                 try {
                     Copy-Item -LiteralPath $SmbPath -Destination $Destination -Force -ErrorAction Stop
                     return @{ Ok = $true; Source = 'smb'; Detail = "Copied from $SmbPath." }
-                } catch { $null = $_ }
+                } catch { $errs.Add("smb-copy: $($_.Exception.Message)") }
+            } elseif ($SmbPath) {
+                $errs.Add("smb: path '$SmbPath' not reachable")
             }
             if ($HttpsUrl) {
                 try {
                     Invoke-WebRequest -Uri $HttpsUrl -OutFile $Destination -UseBasicParsing -SkipCertificateCheck -ErrorAction Stop
                     return @{ Ok = $true; Source = 'https'; Detail = "Downloaded from $HttpsUrl." }
-                } catch { return @{ Ok = $false; Source = 'none'; Detail = "Local/SMB/HTTPS all failed. HTTPS error: $($_.Exception.Message)" } }
+                } catch { $errs.Add("https: $($_.Exception.Message)") }
             }
-            return @{ Ok = $false; Source = 'none'; Detail = "Local/SMB unavailable and no -HttpsUrl provided." }
+            $reason = if ($errs.Count -gt 0) { $errs -join ' | ' } else { 'no -LocalGoldenPath/-SmbPath/-HttpsUrl supplied' }
+            return @{ Ok = $false; Source = 'none'; Detail = "Golden source failed. Tried: $reason" }
         }
         VerifyVhdxHash = {
             param([string]$Path,[string]$ExpectedSha256)
@@ -75,17 +83,47 @@ function Get-DefaultVmInvoker {
             param([string]$Name)
             try {
                 $vm = Get-VM -Name $Name -ErrorAction Stop
-                return @{ Found = $true; State = "$($vm.State)"; AutomaticStartAction = "$($vm.AutomaticStartAction)" }
-            } catch { return @{ Found = $false; State = 'NotPresent'; AutomaticStartAction = $null } }
+                $nic = $vm.NetworkAdapters | Select-Object -First 1
+                $hd  = $vm.HardDrives     | Select-Object -First 1
+                return [pscustomobject]@{
+                    Found                = $true
+                    State                = "$($vm.State)"
+                    AutomaticStartAction = "$($vm.AutomaticStartAction)"
+                    SwitchName           = if ($nic) { "$($nic.SwitchName)" } else { $null }
+                    HardDrivePath        = if ($hd)  { "$($hd.Path)"  } else { $null }
+                    MemoryStartupGb      = if ($vm.MemoryStartup) { [int][math]::Round($vm.MemoryStartup / 1GB) } else { 0 }
+                    ProcessorCount       = [int]$vm.ProcessorCount
+                }
+            } catch {
+                $null = $_
+                return [pscustomobject]@{ Found = $false; State = 'NotPresent'; AutomaticStartAction = $null;
+                                          SwitchName = $null; HardDrivePath = $null; MemoryStartupGb = 0; ProcessorCount = 0 }
+            }
         }
         CreateVm = {
-            param([string]$Name,[string]$VhdxPath,[string]$SwitchName,[long]$MemStartupBytes,[int]$VcpuCount)
+            param(
+                [string]$Name,[string]$VhdxPath,[string]$SwitchName,
+                [long]$MemStartupBytes,[long]$MemMinBytes,[long]$MemMaxBytes,
+                [int]$VcpuCount,[string]$SecureBootTemplate
+            )
             try {
                 New-VM -Name $Name -MemoryStartupBytes $MemStartupBytes -VHDPath $VhdxPath `
                        -SwitchName $SwitchName -Generation 2 -ErrorAction Stop | Out-Null
                 Set-VMProcessor -VMName $Name -Count $VcpuCount -ErrorAction Stop
-                return @{ Ok = $true; Detail = "Created Gen2 VM $Name with $VcpuCount vCPU and $(($MemStartupBytes / 1GB)) GB startup memory, attached to $SwitchName." }
-            } catch { return @{ Ok = $false; Detail = "New-VM/Set-VMProcessor failed: $($_.Exception.Message)" } }
+                Set-VMMemory -VMName $Name -DynamicMemoryEnabled $true `
+                             -StartupBytes $MemStartupBytes `
+                             -MinimumBytes $MemMinBytes `
+                             -MaximumBytes $MemMaxBytes -ErrorAction Stop
+                # Secure Boot template: 'MicrosoftWindows', 'MicrosoftUEFICertificateAuthority' (Linux),
+                # or 'Off' to disable. Project default is MicrosoftWindows.
+                if ($SecureBootTemplate -eq 'Off') {
+                    Set-VMFirmware -VMName $Name -EnableSecureBoot Off -ErrorAction Stop
+                } else {
+                    Set-VMFirmware -VMName $Name -EnableSecureBoot On `
+                                   -SecureBootTemplate $SecureBootTemplate -ErrorAction Stop
+                }
+                return @{ Ok = $true; Detail = "Created Gen2 VM $Name (vCPU=$VcpuCount, mem=$([math]::Round($MemStartupBytes / 1GB,1)) GB startup, $([math]::Round($MemMinBytes/1GB,1))-$([math]::Round($MemMaxBytes/1GB,1)) GB dynamic, SecureBoot=$SecureBootTemplate, switch=$SwitchName)." }
+            } catch { return @{ Ok = $false; Detail = "New-VM / Set-VMProcessor / Set-VMMemory / Set-VMFirmware failed: $($_.Exception.Message)" } }
         }
         ConfigureAutostart = {
             param([string]$Name,[int]$DelaySeconds)
@@ -173,8 +211,11 @@ function Invoke-VmsStage {
         [string]$Prefix,
         [string[]]$Suffixes,
         [int]$MemStartupGb,
+        [int]$MemMinGb,
+        [int]$MemMaxGb,
         [int]$VcpuCount,
         [int]$StaggerSeconds,
+        [string]$SecureBootTemplate,
         [switch]$DryRun
     )
 
@@ -190,13 +231,19 @@ function Invoke-VmsStage {
     if (-not $PSBoundParameters.ContainsKey('Prefix')         -and $vmsCfg -and $vmsCfg.PSObject.Properties['name_prefix'])       { $Prefix         = "$($vmsCfg.name_prefix)" }
     if (-not $PSBoundParameters.ContainsKey('Suffixes')       -and $vmsCfg -and $vmsCfg.PSObject.Properties['name_suffixes'] -and $vmsCfg.name_suffixes) { $Suffixes = @($vmsCfg.name_suffixes) }
     if (-not $PSBoundParameters.ContainsKey('MemStartupGb')   -and $vmsCfg -and $vmsCfg.PSObject.Properties['memory_startup_gb']) { $MemStartupGb   = [int]$vmsCfg.memory_startup_gb }
+    if (-not $PSBoundParameters.ContainsKey('MemMinGb')       -and $vmsCfg -and $vmsCfg.PSObject.Properties['memory_min_gb'])     { $MemMinGb       = [int]$vmsCfg.memory_min_gb }
+    if (-not $PSBoundParameters.ContainsKey('MemMaxGb')       -and $vmsCfg -and $vmsCfg.PSObject.Properties['memory_max_gb'])     { $MemMaxGb       = [int]$vmsCfg.memory_max_gb }
     if (-not $PSBoundParameters.ContainsKey('VcpuCount')      -and $vmsCfg -and $vmsCfg.PSObject.Properties['vcpu_count'])        { $VcpuCount      = [int]$vmsCfg.vcpu_count }
     if (-not $PSBoundParameters.ContainsKey('StaggerSeconds') -and $vmsCfg -and $vmsCfg.PSObject.Properties['stagger_seconds'])   { $StaggerSeconds = [int]$vmsCfg.stagger_seconds }
+    if (-not $PSBoundParameters.ContainsKey('SecureBootTemplate') -and $vmsCfg -and $vmsCfg.PSObject.Properties['secure_boot_template']) { $SecureBootTemplate = "$($vmsCfg.secure_boot_template)" }
     if (-not $Count)          { $Count          = 2 }
     if (-not $Prefix)         { $Prefix         = 'vm-' }
     if (-not $MemStartupGb)   { $MemStartupGb   = 4 }
+    if (-not $MemMinGb)       { $MemMinGb       = [math]::Max(2, [int]($MemStartupGb / 2)) }
+    if (-not $MemMaxGb)       { $MemMaxGb       = [math]::Max($MemStartupGb, $MemStartupGb * 2) }
     if (-not $VcpuCount)      { $VcpuCount      = 2 }
     if (-not $StaggerSeconds) { $StaggerSeconds = 30 }
+    if (-not $SecureBootTemplate) { $SecureBootTemplate = 'MicrosoftWindows' }
 
     if ((-not $GoldenSmbPath -or -not $GoldenHttpsUrl) -and $Config -and `
         $Config.PSObject.Properties['controller'] -and $Config.controller -and `
@@ -212,7 +259,9 @@ function Invoke-VmsStage {
     # ---------- 1. Pick storage drive ----------
     if (-not $VmStorageDrive) {
         $minPerVm = if ($vmsCfg -and $vmsCfg.PSObject.Properties['min_disk_gb_per_vm']) { [int]$vmsCfg.min_disk_gb_per_vm } else { 60 }
-        $minFree  = $Count * $minPerVm
+        # Include the golden VHDX itself (Copy-Item makes full copies, not
+        # differencing) -- so we need Count clones PLUS the golden.
+        $minFree  = ($Count + 1) * $minPerVm
         $drive    = Get-PhysicalDriveBest -MinFreeGb $minFree
         if ($drive) {
             $VmStorageDrive = $drive.DriveLetter
@@ -273,14 +322,28 @@ function Invoke-VmsStage {
         $existing = & $script:VmInvokers.GetVm $name
         if ($existing.Found) {
             $a = & $script:VmInvokers.ConfigureAutostart $name $delay
-            $status = if ($a.Ok) { 'Pass' } else { 'Warn' }
-            Add-VmStep $steps "VM '$name'" $status "Already present (state: $($existing.State)). Autostart re-applied: $($a.Detail)"
+            # Config-drift detection: warn when the existing VM doesn't match
+            # what this run would have created. The GetVm closure returns the
+            # observable fields; mismatch surfaces in Detail without auto-
+            # repairing (operator must Remove-VM and re-run to fix).
+            $drift = New-Object System.Collections.Generic.List[string]
+            if ($existing.PSObject.Properties['SwitchName']      -and $existing.SwitchName      -and $existing.SwitchName      -ne $SwitchName)             { $drift.Add("switch='$($existing.SwitchName)' (expected '$SwitchName')") }
+            if ($existing.PSObject.Properties['MemoryStartupGb'] -and $existing.MemoryStartupGb -and $existing.MemoryStartupGb -ne $MemStartupGb)           { $drift.Add("memStartupGb=$($existing.MemoryStartupGb) (expected $MemStartupGb)") }
+            if ($existing.PSObject.Properties['ProcessorCount']  -and $existing.ProcessorCount  -and $existing.ProcessorCount  -ne $VcpuCount)              { $drift.Add("vcpu=$($existing.ProcessorCount) (expected $VcpuCount)") }
+            $status = if (-not $a.Ok)           { 'Warn' }
+                      elseif ($drift.Count -gt 0) { 'Warn' }
+                      else                        { 'Pass' }
+            $driftMsg = if ($drift.Count -gt 0) { " Config drift: $($drift -join '; ')." } else { '' }
+            $remed    = if ($drift.Count -gt 0) { "Remove the stale VM and re-run: Stop-VM $name -TurnOff -Force; Remove-VM $name -Force" } else { $null }
+            Add-VmStep $steps "VM '$name'" $status "Already present (state: $($existing.State)). Autostart re-applied: $($a.Detail).$driftMsg" $remed
             continue
         }
-        $mem = [long]$MemStartupGb * 1GB
-        $n = & $script:VmInvokers.CreateVm $name $vhdx $SwitchName $mem $VcpuCount
+        $memStartupBytes = [long]$MemStartupGb * 1GB
+        $memMinBytes     = [long]$MemMinGb     * 1GB
+        $memMaxBytes     = [long]$MemMaxGb     * 1GB
+        $n = & $script:VmInvokers.CreateVm $name $vhdx $SwitchName $memStartupBytes $memMinBytes $memMaxBytes $VcpuCount $SecureBootTemplate
         if (-not $n.Ok) {
-            Add-VmStep $steps "VM '$name' create" 'Fail' $n.Detail "Manual: New-VM -Name $name -MemoryStartupBytes $mem -VHDPath $vhdx -SwitchName $SwitchName -Generation 2"
+            Add-VmStep $steps "VM '$name' create" 'Fail' $n.Detail "Manual: New-VM -Name $name -MemoryStartupBytes $memStartupBytes -VHDPath $vhdx -SwitchName $SwitchName -Generation 2"
             continue
         }
         $a = & $script:VmInvokers.ConfigureAutostart $name $delay

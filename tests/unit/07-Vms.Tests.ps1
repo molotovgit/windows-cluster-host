@@ -41,12 +41,13 @@ BeforeAll {
             @{ Ok = $true; AlreadyPresent = $false; Detail = "cloned to $dst" }
         }.GetNewClosure()
         Set-VmInvoker -Name GetVm -ScriptBlock {
-            param($name) @{ Found = $false; State = 'NotPresent'; AutomaticStartAction = $null }
+            param($name) [pscustomobject]@{ Found = $false; State = 'NotPresent'; AutomaticStartAction = $null;
+                                            SwitchName = $null; HardDrivePath = $null; MemoryStartupGb = 0; ProcessorCount = 0 }
         }.GetNewClosure()
         Set-VmInvoker -Name CreateVm -ScriptBlock {
-            param($name,$vhdx,$switch,$mem,$cpu)
-            $caps.Created.Add("$name|$switch|$mem|$cpu")
-            if ($CreateVmOk) { @{ Ok = $true; Detail = "created $name" } } else { @{ Ok = $false; Detail = "create failed" } }
+            param($name,$vhdx,$switch,$memStartup,$memMin,$memMax,$cpu,$secureBoot)
+            $caps.Created.Add("$name|$switch|$memStartup|$cpu|$secureBoot")
+            if ($CreateVmOk) { @{ Ok = $true; Detail = "created $name (secureBoot=$secureBoot)" } } else { @{ Ok = $false; Detail = "create failed" } }
         }.GetNewClosure()
         Set-VmInvoker -Name ConfigureAutostart -ScriptBlock {
             param($name,$delay)
@@ -168,6 +169,76 @@ Describe 'Invoke-VmsStage' {
         $cfg = [pscustomobject]@{ vms = [pscustomobject]@{ count = 5; name_prefix = 'fromcfg-' } }
         $r = Invoke-VmsStage -Config $cfg -Count 2 -Prefix 'override-' -DryRun 6>$null
         $r.VmNames | Should -Be @('override-a','override-b')
+    }
+
+    It 'returns Fail (and creates no VMs) when SHA256 mismatch on the golden VHDX' {
+        # The golden VHDX needs to be sourced (not already present); use a fresh
+        # temp dir to ensure Test-Path returns false for the not-yet-created path.
+        $caps = Set-VmStub
+        Set-VmInvoker -Name VerifyVhdxHash -ScriptBlock {
+            param($p,$h)
+            @{ Ok = $false; Skipped = $false; Hash = 'deadbeef'; Detail = "SHA256 mismatch: actual=deadbeef expected=$h" }
+        }
+        Set-HappyHardware
+        # Use HappyHardware drive D:\VMs; the golden path won't exist there, so
+        # Test-Path is false and SourceGoldenVhdx (mocked Ok=$true) runs, then
+        # VerifyVhdxHash returns Ok=$false -> Overall=Fail.
+        $r = Invoke-VmsStage -Count 2 -GoldenSha256 'abc123' 6>$null
+        $r.Overall | Should -Be 'Fail'
+        ($r.Steps | Where-Object Name -eq 'Golden VHDX SHA256').Status | Should -Be 'Fail'
+        $caps.Created.Count | Should -Be 0
+    }
+
+    It 'Warns with config-drift detail when an existing VM has a different switch/memory' {
+        $caps = Set-VmStub
+        Set-VmInvoker -Name GetVm -ScriptBlock {
+            param($name)
+            [pscustomobject]@{
+                Found                = $true
+                State                = 'Running'
+                AutomaticStartAction = 'Start'
+                SwitchName           = 'OldSwitch'    # mismatch
+                HardDrivePath        = 'D:\VMs\vm-a.vhdx'
+                MemoryStartupGb      = 8              # mismatch
+                ProcessorCount       = 2
+            }
+        }
+        Set-HappyHardware
+        $r = Invoke-VmsStage -SwitchName 'NewSwitch' -MemStartupGb 4 -VcpuCount 2 -Count 1 6>$null
+        $vm = $r.Steps | Where-Object { $_.Name -like "VM 'vm-a*" }
+        $vm.Status | Should -Be 'Warn'
+        $vm.Detail | Should -Match 'switch=''OldSwitch'''
+        $vm.Detail | Should -Match 'memStartupGb=8'
+        $vm.Remediation | Should -Match 'Remove-VM'
+        $caps.Created.Count | Should -Be 0   # existing VM not re-created
+    }
+
+    It 'continues to the next VM when clone fails for one' {
+        $caps = Set-VmStub
+        $script:cloneCalls = 0
+        Set-VmInvoker -Name CloneVhdx -ScriptBlock {
+            param($src,$dst)
+            $script:cloneCalls++
+            if ($script:cloneCalls -eq 1) {
+                @{ Ok = $false; AlreadyPresent = $false; Detail = 'simulated clone fail' }
+            } else {
+                @{ Ok = $true; AlreadyPresent = $false; Detail = "cloned $dst" }
+            }
+        }
+        Set-HappyHardware
+        $r = Invoke-VmsStage -Count 2 6>$null
+        $r.Overall | Should -Be 'Fail'   # at least one clone failed
+        @($r.Steps | Where-Object { $_.Name -like '*clone' -and $_.Status -eq 'Fail' }).Count | Should -Be 1
+        # The second VM still gets created.
+        $caps.Created.Count | Should -Be 1
+    }
+
+    It 'passes SecureBootTemplate from -Config.vms.secure_boot_template to CreateVm' {
+        $caps = Set-VmStub
+        Set-HappyHardware
+        $cfg = [pscustomobject]@{ vms = [pscustomobject]@{ count = 1; secure_boot_template = 'MicrosoftUEFICertificateAuthority' } }
+        $r = Invoke-VmsStage -Config $cfg 6>$null
+        @($caps.Created | Where-Object { $_ -match 'MicrosoftUEFICertificateAuthority' }).Count | Should -Be 1
     }
 
     It 'tolerates partial -Config (vms object without count)' {
