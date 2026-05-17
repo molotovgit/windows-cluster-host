@@ -45,6 +45,7 @@ param(
     [switch]$DryRun,
     [switch]$NoRestart,
     [switch]$SkipDownload,
+    [switch]$AllowSelfSignedController,
     [string]$LogDir
 )
 
@@ -74,32 +75,48 @@ function Resolve-ZipUrl {
     return "https://$Address/cluster-host.zip"
 }
 
+function Confirm-StagingRootSafe {
+    # Guard against an operator passing a -StagingRoot like 'C:\' or a
+    # populated unrelated directory: only wipe a path that either does not
+    # exist OR contains a previous staging marker.
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $marker = Join-Path $Path '.clusterhost-staging'
+    $hasContent = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue).Count -gt 0
+    if ($hasContent -and -not (Test-Path -LiteralPath $marker)) {
+        throw "Refusing to wipe '$Path' -- it is non-empty and does not contain the .clusterhost-staging marker file. Pass an empty -StagingRoot or remove it manually."
+    }
+}
+
 function Copy-RepoTree {
     # When install.ps1 lives inside a checked-out repo, copy that tree to
     # the staging directory (one-shot install from a USB stick or local
     # share). Returns the resolved repo root or $null.
     param([Parameter(Mandatory)][string]$ScriptRoot,[Parameter(Mandatory)][string]$Destination)
     $expected = @('src','config','REVIEW_PROMPT.md')
-    if (-not ($expected | ForEach-Object { Test-Path -LiteralPath (Join-Path $ScriptRoot $_) } | Where-Object { -not $_ })) {
-        # All expected sibling paths exist -> we're inside a checked-out repo.
-        if (Test-Path -LiteralPath $Destination) {
-            Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        New-Item -Path $Destination -ItemType Directory -Force | Out-Null
-        Copy-Item -LiteralPath (Join-Path $ScriptRoot 'src')    -Destination $Destination -Recurse -Force -ErrorAction Stop
-        if (Test-Path (Join-Path $ScriptRoot 'config'))  { Copy-Item -LiteralPath (Join-Path $ScriptRoot 'config')  -Destination $Destination -Recurse -Force }
-        if (Test-Path (Join-Path $ScriptRoot 'scripts')) { Copy-Item -LiteralPath (Join-Path $ScriptRoot 'scripts') -Destination $Destination -Recurse -Force }
-        return $Destination
-    }
-    return $null
-}
-
-function Expand-RepoZip {
-    param([Parameter(Mandatory)][string]$Zip,[Parameter(Mandatory)][string]$Destination)
+    $missing  = @($expected | Where-Object { -not (Test-Path -LiteralPath (Join-Path $ScriptRoot $_)) })
+    if ($missing.Count -gt 0) { return $null }   # not inside a repo
+    Confirm-StagingRootSafe -Path $Destination
     if (Test-Path -LiteralPath $Destination) {
         Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
     }
     New-Item -Path $Destination -ItemType Directory -Force | Out-Null
+    # Drop the staging-dir marker so re-runs can safely wipe.
+    Set-Content -LiteralPath (Join-Path $Destination '.clusterhost-staging') -Value 'managed-by-install.ps1' -Encoding utf8
+    Copy-Item -LiteralPath (Join-Path $ScriptRoot 'src')    -Destination $Destination -Recurse -Force -ErrorAction Stop
+    if (Test-Path (Join-Path $ScriptRoot 'config'))  { Copy-Item -LiteralPath (Join-Path $ScriptRoot 'config')  -Destination $Destination -Recurse -Force }
+    if (Test-Path (Join-Path $ScriptRoot 'scripts')) { Copy-Item -LiteralPath (Join-Path $ScriptRoot 'scripts') -Destination $Destination -Recurse -Force }
+    return $Destination
+}
+
+function Expand-RepoZip {
+    param([Parameter(Mandatory)][string]$Zip,[Parameter(Mandatory)][string]$Destination)
+    Confirm-StagingRootSafe -Path $Destination
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -Path $Destination -ItemType Directory -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $Destination '.clusterhost-staging') -Value 'managed-by-install.ps1' -Encoding utf8
     Expand-Archive -LiteralPath $Zip -DestinationPath $Destination -Force -ErrorAction Stop
     # The zip is expected to contain a top-level folder. Flatten if needed
     # so $Destination\src exists rather than $Destination\<top>\src.
@@ -114,11 +131,26 @@ function Expand-RepoZip {
 function Invoke-WithRetryWebRequest {
     # Tiny built-in retry. We avoid importing lib/Retry.psm1 because the
     # bootstrap runs BEFORE the repo is on disk.
-    param([Parameter(Mandatory)][string]$Url,[Parameter(Mandatory)][string]$OutFile,[int]$Attempts = 3)
+    # SkipCertificateCheck is opt-IN because the project's LAN model
+    # commonly uses self-signed certs; the caller must explicitly state
+    # so it appears in the operator's transcript.
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$OutFile,
+        [int]$Attempts = 3,
+        [switch]$AllowSelfSigned
+    )
+    if ($AllowSelfSigned) {
+        Write-Warning "TLS certificate validation DISABLED for $Url (operator opted in via -AllowSelfSignedController)."
+    }
     $delay = 500
     for ($i = 1; $i -le $Attempts; $i++) {
         try {
-            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -SkipCertificateCheck -ErrorAction Stop
+            if ($AllowSelfSigned) {
+                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -SkipCertificateCheck -ErrorAction Stop
+            } else {
+                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+            }
             return
         } catch {
             if ($i -eq $Attempts) { throw }
@@ -171,9 +203,18 @@ Write-Host "User       : $env:USERDOMAIN\$env:USERNAME"
 Write-Host "StagingRoot: $StagingRoot"
 Write-Host ""
 
-Assert-Prerequisite -Condition ($PSVersionTable.PSVersion -ge [version]'7.0') `
-                     -FailureMessage 'This script requires PowerShell 7+. Install from https://aka.ms/PowerShell and re-run under pwsh.' `
-                     -ExitCode 11
+if ($PSVersionTable.PSVersion -lt [version]'7.0') {
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        Write-Host 'Detected Windows PowerShell 5.1 (Desktop edition). The cluster setup requires PowerShell 7+.' -ForegroundColor Red
+        Write-Host 'Install PowerShell 7 via:'  -ForegroundColor Yellow
+        Write-Host '  winget install --id Microsoft.PowerShell -e'   -ForegroundColor Yellow
+        Write-Host 'Then re-open as Administrator and re-run under pwsh.exe (NOT powershell.exe):' -ForegroundColor Yellow
+        Write-Host '  pwsh -File .\install.ps1' -ForegroundColor Yellow
+    } else {
+        Write-Host 'This script requires PowerShell 7+. Install from https://aka.ms/PowerShell and re-run under pwsh.' -ForegroundColor Red
+    }
+    exit 11
+}
 Assert-Prerequisite -Condition (Test-IsAdministrator) `
                      -FailureMessage 'This script requires Administrator rights. Right-click PowerShell and Run as Administrator.' `
                      -ExitCode 12
@@ -203,7 +244,7 @@ if (-not $SkipDownload) {
             $tmpZip = Join-Path $env:TEMP ("cluster-host-" + [guid]::NewGuid().ToString('N').Substring(0,8) + '.zip')
             Write-Host "Downloading $url -> $tmpZip" -ForegroundColor Yellow
             try {
-                Invoke-WithRetryWebRequest -Url $url -OutFile $tmpZip -Attempts 3
+                Invoke-WithRetryWebRequest -Url $url -OutFile $tmpZip -Attempts 3 -AllowSelfSigned:$AllowSelfSignedController
                 $resolvedRoot = Expand-RepoZip -Zip $tmpZip -Destination $StagingRoot
             } finally {
                 Remove-Item -LiteralPath $tmpZip -Force -ErrorAction SilentlyContinue
@@ -239,7 +280,13 @@ Write-Host "== Launching orchestrator ==" -ForegroundColor Cyan
 Write-Host "  & $orch $($orchArgs -join ' ')" -ForegroundColor DarkGray
 Write-Host ""
 
-& $orch @orchArgs
-$exit = $LASTEXITCODE
-if ($null -eq $exit) { $exit = 0 }
+try {
+    & $orch @orchArgs
+    $exit = $LASTEXITCODE
+    if ($null -eq $exit) { $exit = 0 }
+} catch {
+    Write-Host "Orchestrator threw: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+    $exit = 3
+}
 exit $exit
