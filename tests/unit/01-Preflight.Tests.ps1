@@ -231,6 +231,42 @@ Describe 'Invoke-PreflightStage -- Overall aggregation' {
         $r.Overall | Should -Be 'Fail'
     }
 
+    It '-MinRamGb forces a RAM Fail when set to an impossibly high value' {
+        $r = Invoke-PreflightStage -MinRamGb 999999 -IgnoreFailures 6>$null
+        $ram = $r.Checks | Where-Object Name -eq 'RAM'
+        # Skip the assertion if the host genuinely couldn't report RAM (would Warn);
+        # in any case it must NOT be Pass.
+        $ram.Status | Should -BeIn @('Fail','Warn')
+    }
+
+    It '-MinPwshVersion higher than the current version forces a PowerShell version Fail' {
+        $bumped = [version]'99.0'
+        $r = Invoke-PreflightStage -MinPwshVersion $bumped -IgnoreFailures 6>$null
+        $ver = $r.Checks | Where-Object Name -eq 'PowerShell version'
+        $ver.Status | Should -Be 'Fail'
+        $ver.Remediation | Should -Match 'PowerShell 7'
+    }
+
+    It 'CLUSTERHOST_ALLOW_UNKNOWN_SKU=1 downgrades Unknown SKU from Warn to Pass' {
+        try {
+            $env:CLUSTERHOST_ALLOW_UNKNOWN_SKU = '1'
+            & $script:HD {
+                foreach ($n in 'WindowsEditionCmdlet','RegistryEditionID','WmiOsCaption','ComputerInfoOsName') {
+                    Set-HardwareDetector -Name $n -ScriptBlock { 'TotallyBogus' }
+                }
+            }
+            $r = Invoke-PreflightStage -IgnoreFailures 6>$null
+            ($r.Checks | Where-Object Name -eq 'Windows SKU').Status | Should -Be 'Pass'
+        } finally {
+            Remove-Item Env:CLUSTERHOST_ALLOW_UNKNOWN_SKU -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'does not throw under StrictMode on a partial config (vms object without count)' {
+        $cfg = [pscustomobject]@{ vms = [pscustomobject]@{ min_disk_gb_per_vm = 60 } }   # 'count' missing
+        { Invoke-PreflightStage -Config $cfg -IgnoreFailures 6>$null } | Should -Not -Throw
+    }
+
     It '-IgnoreFailures keeps Overall != Fail even when Fail checks exist' {
         & $script:HD {
             Set-HardwareDetector -Name ComputerInfoVirt -ScriptBlock {

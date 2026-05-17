@@ -113,13 +113,16 @@ function Get-TaskSchedulerStatus {
 }
 
 function Get-EffectiveExecutionPolicy {
+    # PowerShell resolves the effective policy as
+    # MachinePolicy > UserPolicy > Process > CurrentUser > LocalMachine.
+    # Get-ExecutionPolicy (no -Scope) returns that resolved answer, which
+    # is what we want -- if pwsh was launched with -ExecutionPolicy Bypass
+    # (the install.ps1 bootstrap path) the resolved policy is Bypass even
+    # when CurrentUser is Restricted.
     try {
-        $best = $null
-        foreach ($s in 'MachinePolicy','UserPolicy','CurrentUser','LocalMachine','Process') {
-            $p = Get-ExecutionPolicy -Scope $s -ErrorAction SilentlyContinue
-            if ($p -and $p -ne 'Undefined') { $best = $p; break }
-        }
-        return $best
+        $effective = Get-ExecutionPolicy -ErrorAction SilentlyContinue
+        if ($effective -and $effective -ne 'Undefined') { return $effective }
+        return $null
     } catch {
         $null = $_
         return $null
@@ -176,10 +179,13 @@ function Invoke-PreflightStage {
         Add-PreflightCheck -Checks $checks -Name 'Windows SKU' -Status Fail `
             -Detail "Windows Home -- Hyper-V is not available on this SKU." `
             -Remediation 'Upgrade to Windows 11 Pro/Enterprise/Education via Settings -> System -> Activation.'
+    } elseif ($env:CLUSTERHOST_ALLOW_UNKNOWN_SKU) {
+        Add-PreflightCheck -Checks $checks -Name 'Windows SKU' -Status Pass `
+            -Detail "Unknown SKU accepted via CLUSTERHOST_ALLOW_UNKNOWN_SKU. Raw: '$($sku.Raw)' source: $($sku.Source)"
     } else {
         Add-PreflightCheck -Checks $checks -Name 'Windows SKU' -Status Warn `
             -Detail "Could not determine SKU. Raw: '$($sku.Raw)' source: $($sku.Source)" `
-            -Remediation 'Set $env:CLUSTERHOST_ALLOW_UNKNOWN_SKU=1 to override after manual verification.'
+            -Remediation 'Set $env:CLUSTERHOST_ALLOW_UNKNOWN_SKU=1 (or pass -IgnoreFailures) after manual verification.'
     }
 
     # ---------- 3. RAM ----------
@@ -197,10 +203,14 @@ function Invoke-PreflightStage {
     }
 
     # ---------- 4. VM storage ----------
-    $count    = if ($Config -and $Config.PSObject.Properties['vms']) { [int]$Config.vms.count } else { 2 }
-    $perVmGb  = if ($Config -and $Config.PSObject.Properties['vms'] -and $Config.vms.PSObject.Properties['min_disk_gb_per_vm']) {
-                    [int]$Config.vms.min_disk_gb_per_vm
-                } else { 60 }
+    # Guard EACH property under StrictMode -- $Config.vms might exist without
+    # 'count' or 'min_disk_gb_per_vm' on a partial config.
+    $count   = 2
+    $perVmGb = 60
+    if ($Config -and $Config.PSObject.Properties['vms'] -and $Config.vms) {
+        if ($Config.vms.PSObject.Properties['count'])              { $count   = [int]$Config.vms.count }
+        if ($Config.vms.PSObject.Properties['min_disk_gb_per_vm']) { $perVmGb = [int]$Config.vms.min_disk_gb_per_vm }
+    }
     $minFree  = $count * $perVmGb
     $drive    = Get-PhysicalDriveBest -MinFreeGb $minFree
     if ($drive) {
