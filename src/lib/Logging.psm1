@@ -110,7 +110,10 @@ function Read-LogPointer {
     if (-not $line) { return $null }
     if (-not (Test-Path -LiteralPath $line)) { return $null }
 
-    $age = [datetime]::UtcNow - (Get-Item -LiteralPath $line -ErrorAction SilentlyContinue).LastWriteTimeUtc
+    # Guard the race where the file is deleted between Test-Path and Get-Item.
+    $item = Get-Item -LiteralPath $line -ErrorAction SilentlyContinue
+    if (-not $item) { return $null }
+    $age = [datetime]::UtcNow - $item.LastWriteTimeUtc
     if ($age -gt $script:PointerStaleAfter) { return $null }
     return $line
 }
