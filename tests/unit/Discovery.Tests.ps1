@@ -14,7 +14,7 @@ BeforeAll {
 
     # Helper visible to all It blocks (Pester 5 puts BeforeAll-defined
     # functions into the same scope the It blocks run in).
-    function Set-AllOkInvokers {
+    function Set-AllOkInvoker {
         param(
             [string[]]$ResolveMap = @(),
             [hashtable]$ProbeStatus = @{},
@@ -73,7 +73,7 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     AfterEach { & $script:Disc { Reset-DiscoveryInvoker } }
 
     It 'returns Ok=true on a 200 response' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
@@ -82,14 +82,14 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     }
 
     It 'returns Ok=true on a 401 (typical MeshCentral unauthenticated GET)' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 401; Body = '<html>MeshCentral login required</html>' } }
         (Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null).Ok | Should -BeTrue
     }
 
     It 'returns Ok=false on a 500' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 500; Body = '' } }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
@@ -98,7 +98,7 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     }
 
     It 'returns Ok=false with reason=marker-missing on a captive-portal 200 without the MeshCentral marker' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<html><title>Cisco WAP - Authentication Required</title></html>' } }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
@@ -107,7 +107,7 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     }
 
     It 'returns Ok=true on a 401 with an empty body (MeshCentral redirect-401 case)' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk      @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 401; Body = '' } }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
@@ -116,7 +116,7 @@ Describe 'Test-ProbeOk-like behavior via Test-ControllerEndpoint' {
     }
 
     It 'returns Ok=false with reason=tcp-closed when the port is closed' {
-        $caps = Set-AllOkInvokers -TcpOk @{ '10.0.0.7:443' = $false }
+        $caps = Set-AllOkInvoker -TcpOk @{ '10.0.0.7:443' = $false }
         $r = Test-ControllerEndpoint -Address '10.0.0.7' -Port 443 6>$null
         $r.Ok | Should -BeFalse
         $r.Reason | Should -Be 'tcp-closed'
@@ -128,7 +128,7 @@ Describe 'Get-SubnetScanTarget' {
     AfterEach { & $script:Disc { Reset-DiscoveryInvoker } }
 
     It 'produces .1 .10 .100 .254 candidates per usable /24 interface' {
-        $caps = Set-AllOkInvokers -LocalIPv4 @(
+        $caps = Set-AllOkInvoker -LocalIPv4 @(
             [pscustomobject]@{ IPAddress = '192.168.1.55';   PrefixLength = 24 }
             [pscustomobject]@{ IPAddress = '10.0.0.4';       PrefixLength = 22 }
         )
@@ -142,14 +142,14 @@ Describe 'Get-SubnetScanTarget' {
     }
 
     It 'skips /8 / /16 interfaces (too large to scan)' {
-        $caps = Set-AllOkInvokers -LocalIPv4 @(
+        $caps = Set-AllOkInvoker -LocalIPv4 @(
             [pscustomobject]@{ IPAddress = '10.0.0.4'; PrefixLength = 8 }
         )
         Get-SubnetScanTarget | Should -HaveCount 0
     }
 
     It 'returns an empty array when LocalIPv4 yields nothing' {
-        $caps = Set-AllOkInvokers -LocalIPv4 @()
+        $caps = Set-AllOkInvoker -LocalIPv4 @()
         Get-SubnetScanTarget | Should -HaveCount 0
     }
 }
@@ -161,7 +161,7 @@ Describe 'Find-Controller strategy order' {
     It 'uses the config-supplied address when it answers (strategy 1)' {
         $cfgPath = Join-Path $script:tmpRoot 'cfg-good.json'
         Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '10.0.0.7' } }) -Encoding utf8
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         $r = Find-Controller -ConfigPath $cfgPath 6>$null
@@ -173,7 +173,7 @@ Describe 'Find-Controller strategy order' {
     It 'falls through to DNS when the config address does not respond' {
         $cfgPath = Join-Path $script:tmpRoot 'cfg-stale.json'
         Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '10.0.0.99' } }) -Encoding utf8
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -ResolveMap  @('controller.local','10.0.0.7') `
             -TcpOk       @{ '10.0.0.99:443' = $false; '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
@@ -184,7 +184,7 @@ Describe 'Find-Controller strategy order' {
     }
 
     It 'falls back from DNS to subnet scan' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -ResolveMap  @('controller.local',$null,'controller',$null) `
             -LocalIPv4   @([pscustomobject]@{ IPAddress = '192.168.1.55'; PrefixLength = 24 }) `
             -TcpOk       @{ '192.168.1.10:443' = $true } `
@@ -195,7 +195,7 @@ Describe 'Find-Controller strategy order' {
     }
 
     It 'returns $null when every strategy fails' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -ResolveMap @('controller.local',$null,'controller',$null) `
             -LocalIPv4  @([pscustomobject]@{ IPAddress = '192.168.1.55'; PrefixLength = 24 })
         # No TcpOk entries -> all TCP probes return $false.
@@ -204,7 +204,7 @@ Describe 'Find-Controller strategy order' {
 
     It 'persists the discovered address when -PersistPath is supplied AND the source is not config' {
         $persistPath = Join-Path $script:tmpRoot ("discovered-" + [guid]::NewGuid().ToString('N').Substring(0,6) + ".json")
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -ResolveMap  @('controller.local','10.0.0.7') `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
@@ -219,7 +219,7 @@ Describe 'Find-Controller strategy order' {
         $cfgPath     = Join-Path $script:tmpRoot 'cfg-noperist.json'
         $persistPath = Join-Path $script:tmpRoot 'should-not-be-written.json'
         Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '10.0.0.7' } }) -Encoding utf8
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
         Find-Controller -ConfigPath $cfgPath -PersistPath $persistPath 6>$null | Out-Null
@@ -230,7 +230,7 @@ Describe 'Find-Controller strategy order' {
         $cfgPath = Join-Path $script:tmpRoot 'cfg-no-address.json'
         # Config has a controller object but the "address" property is missing.
         Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ port = 443 } }) -Encoding utf8
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -ResolveMap  @('controller.local','10.0.0.7') `
             -TcpOk       @{ '10.0.0.7:443' = $true } `
             -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = 'MeshCentral here' } }
@@ -240,7 +240,7 @@ Describe 'Find-Controller strategy order' {
     }
 
     It 'caps the subnet scan at -MaxSubnetScans' {
-        $caps = Set-AllOkInvokers `
+        $caps = Set-AllOkInvoker `
             -ResolveMap  @('controller.local',$null,'controller',$null) `
             -LocalIPv4   @(
                 [pscustomobject]@{ IPAddress = '192.168.1.55';   PrefixLength = 24 }

@@ -52,7 +52,7 @@ Describe 'Invoke-WithRetry' {
             Invoke-WithRetry -Name 'ioonly' -MaxAttempts 3 -InitialDelayMs 1 `
                 -RetryableException @('IOException') `
                 -ScriptBlock { $script:calls++; throw [System.IO.IOException]::new('disk') } 6>$null
-        } catch {}
+        } catch { $null = $_ }
         $script:calls | Should -Be 3
     }
 
@@ -62,7 +62,7 @@ Describe 'Invoke-WithRetry' {
             Invoke-WithRetry -Name 'wrongtype' -MaxAttempts 5 -InitialDelayMs 1 `
                 -RetryableException @('IOException') `
                 -ScriptBlock { $script:calls++; throw [System.UnauthorizedAccessException]::new('denied') } 6>$null
-        } catch {}
+        } catch { $null = $_ }
         $script:calls | Should -Be 1
     }
 
@@ -72,7 +72,7 @@ Describe 'Invoke-WithRetry' {
             Invoke-WithRetry -Name 'predicate-stop' -MaxAttempts 5 -InitialDelayMs 1 `
                 -ShouldRetry { param($err, $attempt) $false } `
                 -ScriptBlock { $script:calls++; throw 'nope' } 6>$null
-        } catch {}
+        } catch { $null = $_ }
         $script:calls | Should -Be 1
     }
 
@@ -82,7 +82,7 @@ Describe 'Invoke-WithRetry' {
             Invoke-WithRetry -Name 'predicate-throws' -MaxAttempts 5 -InitialDelayMs 1 `
                 -ShouldRetry { throw 'predicate exploded' } `
                 -ScriptBlock { $script:calls++; throw 'underlying failure' } 6>$null
-        } catch {}
+        } catch { $null = $_ }
         $script:calls | Should -Be 1
     }
 
@@ -99,7 +99,7 @@ Describe 'Invoke-WithRetry' {
             try {
                 Invoke-WithRetry -Name 'backoff' -MaxAttempts 4 -InitialDelayMs 100 -BackoffFactor 2.0 `
                     -ScriptBlock { throw 'fail' } 6>$null
-            } catch {}
+            } catch { $null = $_ }
         }
         $sleeps.Count | Should -Be 3
         $sleeps[1]    | Should -BeGreaterThan $sleeps[0]
@@ -114,7 +114,7 @@ Describe 'Invoke-WithRetry' {
             try {
                 Invoke-WithRetry -Name 'cap' -MaxAttempts 6 -InitialDelayMs 1000 -BackoffFactor 10.0 -MaxDelayMs 5000 `
                     -ScriptBlock { throw 'fail' } 6>$null
-            } catch {}
+            } catch { $null = $_ }
         }
         ($sleeps | Measure-Object -Maximum).Maximum | Should -BeLessOrEqual 5000
     }
@@ -131,7 +131,7 @@ Describe 'Invoke-WithRetry' {
                 Invoke-WithRetry -Name 'cap-jitter' -MaxAttempts 12 -InitialDelayMs 1000 `
                     -BackoffFactor 10.0 -MaxDelayMs 2000 -Jitter `
                     -ScriptBlock { throw 'fail' } 6>$null
-            } catch {}
+            } catch { $null = $_ }
         }
         $sleeps.Count | Should -BeGreaterThan 5
         foreach ($s in $sleeps) { $s | Should -BeLessOrEqual 2000 }
@@ -148,7 +148,7 @@ Describe 'Invoke-WithRetry' {
                     $wrapper = [System.InvalidOperationException]::new('wrapped', $inner)
                     throw $wrapper
                 } 6>$null
-        } catch {}
+        } catch { $null = $_ }
         $script:calls | Should -Be 3
     }
 }
