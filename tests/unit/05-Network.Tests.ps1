@@ -110,6 +110,48 @@ Describe 'Invoke-NetworkStage' {
         @($caps.Calls | Where-Object { $_ -like 'NewNetNat*' }).Count | Should -Be 0
     }
 
+    It 'detects partial overlap: /16 route excludes a /24 candidate inside it' {
+        $caps = Set-NetStub -Routes @(
+            [pscustomobject]@{ DestinationPrefix = '192.168.0.0/16' }
+        )
+        $r = Invoke-NetworkStage -CandidateSubnets @('192.168.100.0/24','10.50.0.0/24') 6>$null
+        $r.Overall   | Should -Be 'Pass'
+        $r.Subnet    | Should -Be '10.50.0.0/24'   # 192.168.100.0/24 is inside 192.168.0.0/16 so collides
+    }
+
+    It 'ignores the always-present default route 0.0.0.0/0 when checking collisions' {
+        $caps = Set-NetStub -Routes @(
+            [pscustomobject]@{ DestinationPrefix = '0.0.0.0/0' }
+            [pscustomobject]@{ DestinationPrefix = '169.254.0.0/16' }
+        )
+        $r = Invoke-NetworkStage -CandidateSubnets @('192.168.100.0/24') 6>$null
+        $r.Overall | Should -Be 'Pass'
+        $r.Subnet  | Should -Be '192.168.100.0/24'
+    }
+
+    It 'returns Fail with a clear remediation when a DIFFERENT NetNat already exists' {
+        $caps = Set-NetStub -Nats @(
+            [pscustomobject]@{ Name = 'OtherNat'; InternalIPInterfaceAddressPrefix = '10.99.0.0/24' }
+        )
+        $r = Invoke-NetworkStage -CandidateSubnets @('192.168.100.0/24') 6>$null
+        $r.Overall     | Should -Be 'Fail'
+        $r.Method      | Should -Be 'None'
+        $r.Detail      | Should -Match 'OtherNat'
+        $r.Remediation | Should -Match 'Remove-NetNat'
+        @($caps.Calls | Where-Object { $_ -like 'NewNetNat*' }).Count | Should -Be 0
+    }
+
+    It 'existing-state alias check is strict: vEthernet (ClusterStorage) does not match SwitchName=Cluster' {
+        $caps = Set-NetStub `
+            -Switches @([pscustomobject]@{ Name = 'Cluster'; SwitchType = 'Internal'; NetAdapterInterfaceDescription = '' }) `
+            -NetIPs   @([pscustomobject]@{ IPAddress = '192.168.100.1'; PrefixLength = 24; InterfaceAlias = 'vEthernet (ClusterStorage)' })
+        $r = Invoke-NetworkStage -SwitchName 'Cluster' -CandidateSubnets @('192.168.100.0/24') 6>$null
+        # Should NOT short-circuit to AlreadyConfigured because the IP is on
+        # 'vEthernet (ClusterStorage)' not 'vEthernet (Cluster)'.
+        $r.Method | Should -Not -Be 'AlreadyConfigured'
+        @($caps.Calls | Where-Object { $_ -like 'NewNetIPAddr:vEthernet (Cluster)*' }).Count | Should -Be 1
+    }
+
     It 'returns Overall=Fail when every candidate subnet collides' {
         $caps = Set-NetStub -Routes @(
             [pscustomobject]@{ DestinationPrefix = '192.168.100.0/24' }

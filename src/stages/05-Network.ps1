@@ -114,17 +114,76 @@ function Convert-CidrToPrefix {
     return @{ Network = $net; Prefix = $prefix; Gateway = $gw }
 }
 
-function Find-FreeSubnet {
-    # Returns the first candidate whose /24 doesn't collide with an existing route.
+function ConvertTo-Ipv4Uint32 {
+    param([Parameter(Mandatory)][string]$Ip)
+    $bytes = ([System.Net.IPAddress]::Parse($Ip)).GetAddressBytes()
+    return ([uint32]$bytes[0] -shl 24) -bor ([uint32]$bytes[1] -shl 16) -bor ([uint32]$bytes[2] -shl 8) -bor [uint32]$bytes[3]
+}
+
+function Get-Ipv4Range {
+    # Returns [pscustomobject]@{ Start; End } as UInt32 inclusive bounds.
+    param([Parameter(Mandatory)][string]$Cidr)
+    $parts = $Cidr -split '/'
+    if ($parts.Count -ne 2) { throw "Get-Ipv4Range: '$Cidr' is not CIDR." }
+    $netIp  = $parts[0]
+    $prefix = [int]$parts[1]
+    if ($prefix -lt 0 -or $prefix -gt 32) { throw "Get-Ipv4Range: prefix /$prefix out of range." }
+    $base   = ConvertTo-Ipv4Uint32 -Ip $netIp
+    if ($prefix -eq 0) {
+        $mask = [uint32]0
+    } else {
+        $mask = [uint32](-bnot ([uint32]((1L -shl (32 - $prefix)) - 1L)))
+    }
+    $start = [uint32]($base -band $mask)
+    if ($prefix -eq 0) {
+        $end = [uint32]::MaxValue
+    } else {
+        $end = [uint32]($start + [uint32](([uint32]1 -shl (32 - $prefix)) - 1))
+    }
+    return [pscustomobject]@{ Start = $start; End = $end }
+}
+
+function Test-Ipv4CidrOverlap {
+    # Returns $true if two CIDR ranges share any address.
     param(
-        [Parameter(Mandatory)][string[]]$Candidates
+        [Parameter(Mandatory)][string]$A,
+        [Parameter(Mandatory)][string]$B
     )
+    $ra = Get-Ipv4Range -Cidr $A
+    $rb = Get-Ipv4Range -Cidr $B
+    return -not ($ra.End -lt $rb.Start -or $rb.End -lt $ra.Start)
+}
+
+function Find-FreeSubnet {
+    # Returns the first candidate whose /24 doesn't OVERLAP any existing route.
+    # Uses real CIDR-range arithmetic, not string equality, so a 192.168.0.0/16
+    # route correctly excludes the 192.168.100.0/24 candidate.
+    # Default routes (0.0.0.0/0) and link-local / multicast routes are
+    # intentionally excluded from the overlap check so a candidate is not
+    # rejected by the always-present catch-all.
+    param([Parameter(Mandatory)][string[]]$Candidates)
     $routes = & $script:NetworkInvokers.GetNetRoute
-    $taken  = @($routes | ForEach-Object { "$($_.DestinationPrefix)" } | Where-Object { $_ })
+    $taken  = @(
+        $routes | ForEach-Object { "$($_.DestinationPrefix)" } |
+                  Where-Object {
+                      $_ -and
+                      $_ -notlike '0.0.0.0/0' -and
+                      $_ -notlike '224.0.0.0/*' -and
+                      $_ -notlike '255.255.255.255/*' -and
+                      $_ -notlike '169.254.0.0/*' -and
+                      $_ -match '^\d+\.\d+\.\d+\.\d+/\d+$'
+                  }
+    )
     foreach ($c in $Candidates) {
-        if (-not ($taken -contains $c)) {
-            return $c
+        $collides = $false
+        foreach ($t in $taken) {
+            try {
+                if (Test-Ipv4CidrOverlap -A $c -B $t) { $collides = $true; break }
+            } catch {
+                $null = $_   # malformed route, ignore
+            }
         }
+        if (-not $collides) { return $c }
     }
     return $null
 }
@@ -176,7 +235,6 @@ function Invoke-NetworkStage {
     $parsed  = Convert-CidrToPrefix -Cidr $chosenCidr
     $gateway = $parsed.Gateway
     $prefix  = $parsed.Prefix
-    $network = $parsed.Network
 
     # ---------- vSwitch ----------
     $switches = & $script:NetworkInvokers.GetVMSwitch
@@ -186,19 +244,43 @@ function Invoke-NetworkStage {
     $hasNat = [bool](& $script:NetworkInvokers.HasNetNatCmdlet)
 
     # ---------- existing-state pass-through ----------
+    # Use STRICT alias equality (not -match) so 'Cluster' does not match an
+    # unrelated 'vEthernet (ClusterStorage)'.
+    $expectedAlias = "vEthernet ($SwitchName)"
     if ($existingSwitch -and -not $DryRun) {
         $ips = @(& $script:NetworkInvokers.GetNetIPv4 | Where-Object {
-            $_.InterfaceAlias -match [regex]::Escape($SwitchName) -and $_.IPAddress -eq $gateway -and $_.PrefixLength -eq $prefix
+            $_.InterfaceAlias -eq $expectedAlias -and $_.IPAddress -eq $gateway -and $_.PrefixLength -eq $prefix
         })
         $nats = if ($hasNat) {
             @(& $script:NetworkInvokers.GetNetNat | Where-Object { $_.InternalIPInterfaceAddressPrefix -eq $chosenCidr })
         } else { @() }
         if ($ips.Count -gt 0 -and ($nats.Count -gt 0 -or -not $hasNat)) {
+            $natDesc = if (-not $hasNat) { '(NetNat unavailable; internal-only)' } else { $chosenCidr }
             $result = [pscustomobject]@{
                 Overall = 'Pass'; Method = 'AlreadyConfigured'; SwitchName = $SwitchName
                 Subnet  = $chosenCidr; GatewayIp = $gateway
-                Detail  = "Switch '$SwitchName' already configured with gateway $gateway/$prefix and NAT $(if(-not $hasNat){'(NetNat unavailable; internal-only)'}else{$chosenCidr})."
+                Detail  = "Switch '$SwitchName' already configured with gateway $gateway/$prefix and NAT $natDesc."
                 Remediation = $null
+            }
+            Write-NetworkLog $result
+            return $result
+        }
+    }
+
+    # ---------- NetNat single-instance check ----------
+    # Windows permits exactly ONE NetNat per machine. If a DIFFERENT NAT
+    # already exists, surface a Fail with an actionable remediation rather
+    # than letting New-NetNat fail with a generic CIM error.
+    if ($hasNat -and -not $DryRun) {
+        $allNats = @(& $script:NetworkInvokers.GetNetNat)
+        $conflicting = @($allNats | Where-Object { $_.InternalIPInterfaceAddressPrefix -ne $chosenCidr })
+        if ($conflicting.Count -gt 0) {
+            $existing = $conflicting[0]
+            $result = [pscustomobject]@{
+                Overall = 'Fail'; Method = 'None'; SwitchName = $SwitchName
+                Subnet  = $chosenCidr; GatewayIp = $gateway
+                Detail  = "Windows allows only one NetNat per host, but a different NetNat already exists: name='$($existing.Name)' prefix='$($existing.InternalIPInterfaceAddressPrefix)'."
+                Remediation = "Either align cluster-config.json's nat_candidate_subnets to include '$($existing.InternalIPInterfaceAddressPrefix)' (so this stage reuses the existing NAT), or remove it: 'Remove-NetNat -Name $($existing.Name) -Confirm:`$false'."
             }
             Write-NetworkLog $result
             return $result
