@@ -42,7 +42,8 @@ param(
     [ValidateSet('Warning','Error')]
     [string]$MinSeverity = 'Warning',
     [string]$SettingsPath,
-    [switch]$Fix
+    [switch]$Fix,
+    [switch]$SkipInstall
 )
 
 Set-StrictMode -Version Latest
@@ -64,7 +65,11 @@ if (-not $Paths -or $Paths.Count -eq 0) {
 
 # --- bootstrap PSScriptAnalyzer if missing ---
 if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
-    Write-Host 'PSScriptAnalyzer not installed. Installing into CurrentUser scope...' -ForegroundColor Yellow
+    if ($SkipInstall) {
+        Write-Error "PSScriptAnalyzer is not installed and -SkipInstall was specified. Run: Install-Module PSScriptAnalyzer -Scope CurrentUser"
+        exit 2
+    }
+    Write-Host 'PSScriptAnalyzer not installed. Installing into CurrentUser scope (-SkipInstall to refuse)...' -ForegroundColor Yellow
     try {
         Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force -ErrorAction Stop -SkipPublisherCheck
     } catch {

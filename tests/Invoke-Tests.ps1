@@ -36,7 +36,9 @@ param(
     [switch]$Integration,
 
     [ValidateSet('None','Minimal','Normal','Detailed','Diagnostic')]
-    [string]$Verbosity = 'Normal'
+    [string]$Verbosity = 'Normal',
+
+    [switch]$SkipInstall
 )
 
 Set-StrictMode -Version Latest
@@ -46,16 +48,25 @@ $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $unitDir  = Join-Path $repoRoot 'tests\unit'
 $intDir   = Join-Path $repoRoot 'tests\integration'
 
-$paths = switch ($PSCmdlet.ParameterSetName) {
+$rawPaths = switch ($PSCmdlet.ParameterSetName) {
     'Unit'        { @($unitDir) }
     'Integration' { @($intDir)  }
-    default       { @($unitDir, $intDir) | Where-Object { Test-Path -LiteralPath $_ } }
+    default       { @($unitDir, $intDir) }
+}
+$paths = @($rawPaths | Where-Object { Test-Path -LiteralPath $_ })
+if ($paths.Count -eq 0) {
+    Write-Host "(no test directories exist yet under $repoRoot\tests; nothing to run)" -ForegroundColor DarkGray
+    exit 0
 }
 
 # --- bootstrap Pester 5 if missing ---
 $pesterAvail = Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge [version]'5.0.0' }
 if (-not $pesterAvail) {
-    Write-Host 'Pester 5+ not installed. Installing into CurrentUser scope...' -ForegroundColor Yellow
+    if ($SkipInstall) {
+        Write-Error "Pester 5+ is not installed and -SkipInstall was specified. Run: Install-Module Pester -Scope CurrentUser -MinimumVersion 5.0.0 -SkipPublisherCheck"
+        exit 2
+    }
+    Write-Host 'Pester 5+ not installed. Installing into CurrentUser scope (-SkipInstall to refuse)...' -ForegroundColor Yellow
     try {
         Install-Module -Name Pester -Scope CurrentUser -Force -ErrorAction Stop -SkipPublisherCheck -MinimumVersion 5.0.0
     } catch {

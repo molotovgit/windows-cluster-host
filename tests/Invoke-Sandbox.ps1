@@ -15,11 +15,23 @@
 
 .PARAMETER SkipIntegration
     Skip stage 3 (useful while integration tests don't exist yet).
+
+.PARAMETER StopOnFirstFailure
+    Abort the harness after the first non-zero stage. Default is to run
+    every stage even after a failure so contributors get the full picture
+    in a single pass.
+
+.PARAMETER SkipInstall
+    Forwarded to Invoke-Lint / Invoke-Tests. Refuses to auto-install
+    PSScriptAnalyzer / Pester when missing; emits an error with the manual
+    install command instead.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$SkipIntegration
+    [switch]$SkipIntegration,
+    [switch]$StopOnFirstFailure,
+    [switch]$SkipInstall
 )
 
 Set-StrictMode -Version Latest
@@ -28,47 +40,62 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $stages = @()
 
+$script:abort = $false
 function Invoke-Stage {
     param(
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][scriptblock]$Block
     )
+    if ($script:abort) { return }
     Write-Host "`n===== $Name =====" -ForegroundColor Yellow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $code = 0
     try {
         & $Block
         $code = $LASTEXITCODE
         if ($null -eq $code) { $code = 0 }
-        $sw.Stop()
-        $script:stages += [pscustomobject]@{ Name = $Name; ExitCode = $code; Seconds = [math]::Round($sw.Elapsed.TotalSeconds,2) }
-        if ($code -ne 0) { Write-Host "${Name}: FAIL ($code) in $($sw.Elapsed.TotalSeconds)s" -ForegroundColor Red }
-        else             { Write-Host "${Name}: OK in $($sw.Elapsed.TotalSeconds)s" -ForegroundColor Green }
     } catch {
-        $sw.Stop()
-        $script:stages += [pscustomobject]@{ Name = $Name; ExitCode = 99; Seconds = [math]::Round($sw.Elapsed.TotalSeconds,2) }
+        $code = 99
         Write-Host "${Name}: THREW -- $($_.Exception.Message)" -ForegroundColor Red
+    }
+    $sw.Stop()
+    $secs = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+    $script:stages += [pscustomobject]@{ Name = $Name; ExitCode = $code; Seconds = $secs }
+    if ($code -ne 0) { Write-Host "${Name}: FAIL ($code) in ${secs}s" -ForegroundColor Red }
+    else             { Write-Host "${Name}: OK in ${secs}s" -ForegroundColor Green }
+    if ($code -ne 0 -and $StopOnFirstFailure) {
+        Write-Host "Stop-on-first-failure: aborting after $Name." -ForegroundColor Red
+        $script:abort = $true
     }
 }
 
+$lintScript  = Join-Path $PSScriptRoot 'Invoke-Lint.ps1'
+$testsScript = Join-Path $PSScriptRoot 'Invoke-Tests.ps1'
+
 Invoke-Stage -Name 'Lint' -Block {
-    & (Join-Path $PSScriptRoot 'Invoke-Lint.ps1')
+    if ($SkipInstall) { & $lintScript -SkipInstall } else { & $lintScript }
 }
 
 Invoke-Stage -Name 'Pester unit' -Block {
-    & (Join-Path $PSScriptRoot 'Invoke-Tests.ps1') -Unit -Verbosity Minimal
+    if ($SkipInstall) { & $testsScript -Unit -Verbosity Minimal -SkipInstall }
+    else              { & $testsScript -Unit -Verbosity Minimal }
 }
 
 if (-not $SkipIntegration -and (Test-Path -LiteralPath (Join-Path $repoRoot 'tests\integration'))) {
     $hasFiles = Get-ChildItem -LiteralPath (Join-Path $repoRoot 'tests\integration') -Filter '*.Tests.ps1' -Recurse -ErrorAction SilentlyContinue
     if ($hasFiles) {
         Invoke-Stage -Name 'Pester integration' -Block {
-            & (Join-Path $PSScriptRoot 'Invoke-Tests.ps1') -Integration -Verbosity Minimal
+            if ($SkipInstall) { & $testsScript -Integration -Verbosity Minimal -SkipInstall }
+            else              { & $testsScript -Integration -Verbosity Minimal }
         }
     } else {
         Write-Host "`n(no integration tests yet)" -ForegroundColor DarkGray
     }
 }
 
+# Manifests stage: do NOT exit from inside the scriptblock -- the parent
+# script must run the summary table even on failure. Use $global:LASTEXITCODE
+# so the caller's $LASTEXITCODE capture on the next line picks it up.
 Invoke-Stage -Name 'Manifests' -Block {
     $manifests = Get-ChildItem -LiteralPath (Join-Path $repoRoot 'src\lib') -Filter '*.psd1' -Recurse -ErrorAction SilentlyContinue
     if (-not $manifests) { Write-Host '(no manifests to verify)' -ForegroundColor DarkGray; return }
@@ -82,7 +109,7 @@ Invoke-Stage -Name 'Manifests' -Block {
             $failed++
         }
     }
-    if ($failed -gt 0) { $script:LASTEXITCODE = 1; exit 1 }
+    $global:LASTEXITCODE = if ($failed -gt 0) { 1 } else { 0 }
 }
 
 # Summary

@@ -11,20 +11,19 @@
         'PSAvoidUsingConvertToSecureStringWithPlainText',
         'PSAvoidUsingInvokeExpression',
         'PSAvoidUsingPlainTextForPassword',
-        'PSAvoidUsingPositionalParameters',
         'PSAvoidUsingUserNameAndPasswordParams',
         'PSAvoidUsingWMICmdlet',
         'PSReservedCmdletChar',
         'PSReservedParams',
         'PSUseCmdletCorrectly',
-        'PSUseDeclaredVarsMoreThanAssignments',
         'PSUsePSCredentialType',
         'PSUseSingularNouns',
         'PSUseToExportFieldsInManifest',
         'PSUseUTF8EncodingForHelpFile',
         'PSAvoidTrailingWhitespace',
         'PSPossibleIncorrectComparisonWithNull',
-        'PSPossibleIncorrectUsageOfRedirectionOperator'
+        'PSPossibleIncorrectUsageOfRedirectionOperator',
+        'PSPossibleIncorrectUsageOfAssignmentOperator'
     )
 
     # Suppress positional-parameter noise for cmdlets where positional usage
