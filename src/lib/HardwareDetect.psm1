@@ -42,6 +42,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # Soft-dependency on Logging.psm1, same pattern as State.psm1 / Retry.psm1.
+# Lookup result is cached so repeated detector calls don't re-probe.
+$script:LoggingLookupTried = $false
+$script:LoggingCmd         = $null
 function Write-ClusterLogIfAvailable {
     [CmdletBinding()]
     param(
@@ -50,17 +53,20 @@ function Write-ClusterLogIfAvailable {
         [string]$Stage = 'hardware',
         [hashtable]$Data
     )
-    $cmd = Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue
-    if (-not $cmd) {
-        $sibling = Join-Path $PSScriptRoot 'Logging.psm1'
-        if (Test-Path -LiteralPath $sibling) {
-            Import-Module -Name $sibling -Force -ErrorAction SilentlyContinue
-            $cmd = Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue
+    if (-not $script:LoggingLookupTried) {
+        $script:LoggingCmd = Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue
+        if (-not $script:LoggingCmd) {
+            $sibling = Join-Path $PSScriptRoot 'Logging.psm1'
+            if (Test-Path -LiteralPath $sibling) {
+                Import-Module -Name $sibling -Force -ErrorAction SilentlyContinue
+                $script:LoggingCmd = Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue
+            }
         }
+        $script:LoggingLookupTried = $true
     }
-    if (-not $cmd) { return }
-    if ($Data) { & $cmd -Level $Level -Message $Message -Stage $Stage -Data $Data }
-    else       { & $cmd -Level $Level -Message $Message -Stage $Stage }
+    if (-not $script:LoggingCmd) { return }
+    if ($Data) { & $script:LoggingCmd -Level $Level -Message $Message -Stage $Stage -Data $Data }
+    else       { & $script:LoggingCmd -Level $Level -Message $Message -Stage $Stage }
 }
 
 # Detector seam. Production calls the real Windows cmdlets; unit tests can
@@ -134,14 +140,35 @@ function Reset-HardwareDetector {
 # ---------- Windows SKU ----------
 
 function ConvertTo-CanonicalSku {
+    <#
+    .SYNOPSIS
+        Map a raw Windows edition string to one of Home | Pro | Enterprise |
+        Education | Unknown.
+
+    .NOTES
+        Pro derivatives (Pro Education, Pro for Workstations, Pro
+        SingleLanguage) collapse to 'Pro' -- they all support Hyper-V and
+        are equivalent for the downstream Preflight gate. Pro Education
+        specifically does NOT collapse to 'Education' even though Microsoft
+        labels it as such; for the purposes of this script it's a Pro SKU.
+
+        LTSC variants (EnterpriseS, EnterpriseG, IoTEnterpriseLTSC) collapse
+        to 'Enterprise' via the substring match.
+    #>
     param([string]$Raw)
     if (-not $Raw) { return 'Unknown' }
     $t = $Raw.ToLowerInvariant()
     switch -Regex ($t) {
+        # Pro derivatives MUST be checked before 'education' / 'enterprise' so
+        # 'ProEducation' / 'Pro Education' classify as Pro, not Education.
+        'pro\s*education'      { return 'Pro' }
+        'pro\s*single\s*language' { return 'Pro' }
+        'pro\s*for\s*workstations' { return 'Pro' }
         'enterprise'           { return 'Enterprise' }
         'education'            { return 'Education' }
         'professional'         { return 'Pro' }
         '\bpro(\b|fessional)'  { return 'Pro' }
+        '^pro'                 { return 'Pro' }    # bare 'Pro', 'ProN', 'ProSingleLanguage'
         '\bhome\b'             { return 'Home' }
         '\bcore'               { return 'Home' }   # 'Core', 'CoreSingleLanguage', etc. are Home flavors
         default                { return 'Unknown' }
@@ -194,8 +221,10 @@ function Get-PhysicalDriveBest {
         capacity wins, subject to a minimum free-GB threshold.
 
     .PARAMETER MinFreeGb
-        Lower bound on free space the drive must have (default 60 GB per VM
-        x default 2 VMs == 120 GB).
+        Lower bound on free space the drive must have. Default 120 GB
+        assumes 2 VMs x 60 GB. Callers that change the VM count or VHDX
+        size MUST pass an explicit value (Preflight stage computes it
+        from cluster-config.json: vms.count * vms.min_disk_gb_per_vm).
 
     .PARAMETER ExcludeSystem
         When set, exclude the OS drive (C: or whatever $env:SystemDrive is)
@@ -288,11 +317,14 @@ function Get-ActiveWifiAdapter {
     param()
 
     # Primary: Get-NetAdapter where MediaType matches wireless and Status=Up.
+    # Excludes Hyper-V virtual adapters (Virtual=$true) so a re-run after PR 11
+    # enables Hyper-V doesn't pick a vSwitch-attached pseudo-NIC.
     $nics = & $script:Detector['NetAdapterList']
     if ($nics) {
         $w = $nics | Where-Object {
             ($_.MediaType -match 'Native 802\.11' -or $_.MediaType -match 'Wireless') -and
-            $_.Status -eq 'Up'
+            $_.Status -eq 'Up' -and
+            -not ($_.PSObject.Properties['Virtual'] -and $_.Virtual)
         } | Select-Object -First 1
         if ($w) {
             Write-ClusterLogIfAvailable -Level Info -Message "WiFi adapter detected" -Data @{
@@ -352,27 +384,60 @@ function Get-VirtualizationSupport {
 
     $reasons = @{}
     $info = & $script:Detector['ComputerInfoVirt']
+
+    # Track which properties Get-ComputerInfo actually answered so we can
+    # distinguish "confirmed false" from "could not be determined" downstream.
+    $hvInfoOk   = $false
+    $vtInfoOk   = $false
+    $slatInfoOk = $false
     if ($info) {
-        $reasons['HyperVisorPresent']  = $info.HyperVisorPresent
-        $reasons['VtSupported']        = $info.HyperVRequirementVirtualizationFirmwareEnabled
-        $reasons['SlatSupported']      = $info.HyperVRequirementSecondLevelAddressTranslation
+        if ($null -ne $info.HyperVisorPresent) {
+            $reasons['HyperVisorPresent']       = [bool]$info.HyperVisorPresent
+            $reasons['HyperVisorPresentSource'] = 'Get-ComputerInfo'
+            $hvInfoOk = $true
+        }
+        if ($null -ne $info.HyperVRequirementVirtualizationFirmwareEnabled) {
+            $reasons['VtSupported'] = [bool]$info.HyperVRequirementVirtualizationFirmwareEnabled
+            $reasons['VtSource']    = 'Get-ComputerInfo'
+            $vtInfoOk = $true
+        }
+        if ($null -ne $info.HyperVRequirementSecondLevelAddressTranslation) {
+            $reasons['SlatSupported'] = [bool]$info.HyperVRequirementSecondLevelAddressTranslation
+            $reasons['SlatSource']    = 'Get-ComputerInfo'
+            $slatInfoOk = $true
+        }
     }
 
     # Secondary signal for VT: WMI Win32_Processor flag. Useful when the
     # Get-ComputerInfo path can't read the firmware setting (older
     # Windows builds or virtual hosts).
-    $wmiVt = & $script:Detector['WmiProcessorVirtFlag']
-    if ($null -eq $reasons['VtSupported'] -and $null -ne $wmiVt) {
-        $reasons['VtSupported']  = [bool]$wmiVt
-        $reasons['VtSource']     = 'Win32_Processor.VirtualizationFirmwareEnabled'
-    } elseif ($info) {
-        $reasons['VtSource']     = 'Get-ComputerInfo'
+    if (-not $vtInfoOk) {
+        $wmiVt = & $script:Detector['WmiProcessorVirtFlag']
+        if ($null -ne $wmiVt) {
+            $reasons['VtSupported'] = [bool]$wmiVt
+            $reasons['VtSource']    = 'Win32_Processor.VirtualizationFirmwareEnabled'
+            $vtInfoOk = $true
+        }
     }
 
-    $hvPresent = [bool]$reasons['HyperVisorPresent']
-    $vt        = [bool]$reasons['VtSupported']
-    $slat      = [bool]$reasons['SlatSupported']
-    $canRun    = $vt -and $slat   # Hyper-V can be ENABLED even if not yet running
+    if (-not $hvInfoOk)   { $reasons['HyperVisorPresentSource'] = 'unknown' }
+    if (-not $vtInfoOk)   { $reasons['VtSource']                = 'unknown' }
+    if (-not $slatInfoOk) { $reasons['SlatSource']              = 'unknown' }
+
+    if (-not ($hvInfoOk -and $vtInfoOk -and $slatInfoOk)) {
+        Write-ClusterLogIfAvailable -Level Warn -Message "Virtualization-support probe incomplete" -Data @{
+            hyperVisorPresentSource = $reasons['HyperVisorPresentSource']
+            vtSource                = $reasons['VtSource']
+            slatSource              = $reasons['SlatSource']
+        }
+    }
+
+    $hvPresent = if ($reasons.ContainsKey('HyperVisorPresent')) { [bool]$reasons['HyperVisorPresent'] } else { $false }
+    $vt        = if ($reasons.ContainsKey('VtSupported'))       { [bool]$reasons['VtSupported']       } else { $false }
+    $slat      = if ($reasons.ContainsKey('SlatSupported'))     { [bool]$reasons['SlatSupported']     } else { $false }
+    # CanRunHyperV is conservative: requires BOTH VT and SLAT to be CONFIRMED true.
+    # Unknown values are treated as 'not confirmed', so CanRunHyperV stays false.
+    $canRun    = $vt -and $slat
 
     $result = [pscustomobject]@{
         HyperVisorPresent = $hvPresent

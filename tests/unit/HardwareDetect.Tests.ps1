@@ -37,6 +37,20 @@ Describe 'ConvertTo-CanonicalSku' {
         ConvertTo-CanonicalSku ''      | Should -Be 'Unknown'
         ConvertTo-CanonicalSku 'XYZ'   | Should -Be 'Unknown'
     }
+    It 'Pro Education classifies as Pro, not Education' {
+        ConvertTo-CanonicalSku 'ProEducation'                            | Should -Be 'Pro'
+        ConvertTo-CanonicalSku 'Pro Education'                           | Should -Be 'Pro'
+        ConvertTo-CanonicalSku 'Microsoft Windows 11 Pro Education'      | Should -Be 'Pro'
+    }
+    It 'ProSingleLanguage classifies as Pro' {
+        ConvertTo-CanonicalSku 'ProSingleLanguage'   | Should -Be 'Pro'
+    }
+    It 'LTSC variants collapse to Enterprise' {
+        ConvertTo-CanonicalSku 'EnterpriseS'               | Should -Be 'Enterprise'
+        ConvertTo-CanonicalSku 'EnterpriseG'               | Should -Be 'Enterprise'
+        ConvertTo-CanonicalSku 'IoTEnterpriseLTSC'         | Should -Be 'Enterprise'
+        ConvertTo-CanonicalSku 'IoTEnterprise'             | Should -Be 'Enterprise'
+    }
 }
 
 Describe 'Get-WindowsSku (strategy fallbacks)' {
@@ -216,6 +230,18 @@ Describe 'Get-ActiveWifiAdapter' {
         Get-ActiveWifiAdapter 6>$null | Should -BeNullOrEmpty
     }
 
+    It 'skips Hyper-V virtual wireless adapters even when MediaType matches' {
+        & $script:HD {
+            Set-HardwareDetector -Name NetAdapterList -ScriptBlock { @(
+                [pscustomobject]@{ Name = 'vEthernet (cluster-wifi)'; InterfaceIndex = 22; MediaType = 'Native 802.11'; Status = 'Up'; Virtual = $true  }
+                [pscustomobject]@{ Name = 'Wi-Fi';                    InterfaceIndex = 7;  MediaType = 'Native 802.11'; Status = 'Up'; Virtual = $false }
+            ) }
+            Set-HardwareDetector -Name WmiNetAdapterList -ScriptBlock { @() }
+        }
+        $r = Get-ActiveWifiAdapter 6>$null
+        $r.Name | Should -Be 'Wi-Fi'
+    }
+
     It 'ignores Down wireless adapters' {
         & $script:HD {
             Set-HardwareDetector -Name NetAdapterList -ScriptBlock { @(
@@ -272,6 +298,26 @@ Describe 'Get-VirtualizationSupport' {
         $r = Get-VirtualizationSupport 6>$null
         $r.VtSupported            | Should -BeTrue
         $r.Reasons['VtSource']    | Should -Be 'Win32_Processor.VirtualizationFirmwareEnabled'
+    }
+
+    It 'marks each Source as "unknown" when partial properties are null' {
+        & $script:HD {
+            Set-HardwareDetector -Name ComputerInfoVirt -ScriptBlock {
+                # Only HyperVisorPresent is answered; VT + SLAT come back null.
+                [pscustomobject]@{
+                    HyperVisorPresent                                = $true
+                    HyperVRequirementVirtualizationFirmwareEnabled   = $null
+                    HyperVRequirementSecondLevelAddressTranslation   = $null
+                }
+            }
+            Set-HardwareDetector -Name WmiProcessorVirtFlag -ScriptBlock { $null }
+        }
+        $r = Get-VirtualizationSupport 6>$null
+        $r.HyperVisorPresent                | Should -BeTrue
+        $r.Reasons['HyperVisorPresentSource'] | Should -Be 'Get-ComputerInfo'
+        $r.Reasons['VtSource']                | Should -Be 'unknown'
+        $r.Reasons['SlatSource']              | Should -Be 'unknown'
+        $r.CanRunHyperV                       | Should -BeFalse   # unknown VT/SLAT is conservative-false
     }
 }
 
