@@ -83,8 +83,9 @@ function Get-DefaultHypervInvoker {
         }
         EnableViaDism = {
             try {
-                $args = @('/online','/enable-feature',"/featurename:$script:HypervFeatureName",'/all','/norestart','/quiet')
-                $out  = & dism.exe @args 2>&1
+                # NOTE: name $dismArgs (not $args) -- $args is a PowerShell automatic variable.
+                $dismArgs = @('/online','/enable-feature',"/featurename:$script:HypervFeatureName",'/all','/norestart','/quiet')
+                $out  = & dism.exe @dismArgs 2>&1
                 $code = $LASTEXITCODE
                 # DISM exit 0 = success+no-restart, 3010 = success+restart-required.
                 $ok            = ($code -eq 0 -or $code -eq 3010)
@@ -226,8 +227,22 @@ function Invoke-HypervStage {
     if ($a2.Ok) { return New-HypervResult -State $state -Attempts $attempts -Winner 'DISM' }
 
     $a3 = & $script:HypervInvokers.EnableViaCapability
+    # Add-WindowsCapability with the 'Hyper-V~~~~' name installs management
+    # tools but does NOT enable the Microsoft-Hyper-V-All platform feature on
+    # Windows 11. To avoid falsely claiming success when the hypervisor was
+    # never actually enabled, re-probe the optional feature state and only
+    # accept this path if the platform itself is now Enabled or EnablePending.
+    if ($a3.Ok) {
+        $verify = & $script:HypervInvokers.GetFeatureState
+        if (("$($verify.State)") -in 'Enabled','EnablePending') {
+            $a3.Detail += " (verified: state=$($verify.State))"
+            $attempts  += @{ Method = 'WindowsCapability'; Ok = $true; RestartNeeded = ($a3.RestartNeeded -or $verify.RestartNeeded); Detail = $a3.Detail }
+            return New-HypervResult -State $state -Attempts $attempts -Winner 'WindowsCapability'
+        }
+        $a3.Ok     = $false
+        $a3.Detail = "Add-WindowsCapability returned success but re-probe shows platform state '$($verify.State)' -- capability path likely installed only management tools, not the hypervisor."
+    }
     $attempts += @{ Method = 'WindowsCapability'; Ok = $a3.Ok; RestartNeeded = $a3.RestartNeeded; Detail = $a3.Detail }
-    if ($a3.Ok) { return New-HypervResult -State $state -Attempts $attempts -Winner 'WindowsCapability' }
 
     # All three failed.
     $result = [pscustomobject]@{

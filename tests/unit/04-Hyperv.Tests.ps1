@@ -103,15 +103,41 @@ Describe 'Invoke-HypervStage' {
         $caps.Calls       | Should -Not -Contain 'EnableViaCapability'
     }
 
-    It 'falls back to WindowsCapability when both Cmdlet AND DISM fail' {
-        $caps = Set-HypervStub -State 'Disabled' `
-                               -CmdletOk $false `
-                               -DismOk $false `
-                               -CapOk $true -CapRestartNeeded $false
+    It 'falls back to WindowsCapability when both Cmdlet AND DISM fail (and platform now Enabled)' {
+        # Two GetFeatureState calls: first is the initial probe (Disabled),
+        # second is the verify-after-Capability probe (Enabled).
+        Reset-HypervInvoker
+        $script:gfsCalls = 0
+        Set-HypervInvoker -Name GetFeatureState -ScriptBlock {
+            $script:gfsCalls++
+            if ($script:gfsCalls -eq 1) { @{ State = 'Disabled'; RestartNeeded = $false } }
+            else                        { @{ State = 'Enabled';  RestartNeeded = $false } }
+        }
+        Set-HypervInvoker -Name EnableViaCmdlet     -ScriptBlock { @{ Ok = $false; RestartNeeded = $false; Detail = 'cmdlet-fail' } }
+        Set-HypervInvoker -Name EnableViaDism       -ScriptBlock { @{ Ok = $false; RestartNeeded = $false; Detail = 'dism-fail' } }
+        Set-HypervInvoker -Name EnableViaCapability -ScriptBlock { @{ Ok = $true;  RestartNeeded = $false; Detail = 'cap-ok'    } }
+
         $r = Invoke-HypervStage 6>$null
-        $r.Overall        | Should -Be 'Pass'
-        $r.Method         | Should -Be 'WindowsCapability'
-        $caps.Calls       | Should -Contain 'EnableViaCapability'
+        $r.Overall | Should -Be 'Pass'
+        $r.Method  | Should -Be 'WindowsCapability'
+        $r.Detail  | Should -Match 'verified'
+    }
+
+    It 'rejects the WindowsCapability path when the platform feature is still Disabled after the call' {
+        Reset-HypervInvoker
+        $script:gfsCalls = 0
+        Set-HypervInvoker -Name GetFeatureState -ScriptBlock {
+            $script:gfsCalls++
+            @{ State = 'Disabled'; RestartNeeded = $false }   # both probes report Disabled
+        }
+        Set-HypervInvoker -Name EnableViaCmdlet     -ScriptBlock { @{ Ok = $false; RestartNeeded = $false; Detail = 'cmdlet-fail' } }
+        Set-HypervInvoker -Name EnableViaDism       -ScriptBlock { @{ Ok = $false; RestartNeeded = $false; Detail = 'dism-fail' } }
+        Set-HypervInvoker -Name EnableViaCapability -ScriptBlock { @{ Ok = $true;  RestartNeeded = $false; Detail = 'cap-ok'    } }
+
+        $r = Invoke-HypervStage 6>$null
+        $r.Overall | Should -Be 'Fail'
+        $r.Method  | Should -Be 'None'
+        $r.Detail  | Should -Match 'management tools'
     }
 
     It 'reports Overall=Fail with a multi-line remediation when every strategy fails' {
