@@ -40,6 +40,31 @@ function Get-DefaultPersistPath {
     return (Join-Path $env:ProgramData 'ClusterHost\state\controller.json')
 }
 
+function Confirm-PersistPathWritable {
+    # Make sure the persist directory exists and is writable before delegating
+    # to Find-Controller (whose WriteDiscovered would otherwise throw an
+    # access-denied exception that escapes the stage's structured Fail
+    # contract). On failure, fall back to LOCALAPPDATA as a last resort.
+    param([Parameter(Mandatory)][string]$Path)
+    $dir = Split-Path -Parent $Path
+    if (-not $dir) { return $Path }
+
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            New-Item -Path $dir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        $probe = Join-Path $dir ('.write-probe-' + [guid]::NewGuid().ToString('N'))
+        Set-Content -LiteralPath $probe -Value 'ok' -Encoding utf8 -ErrorAction Stop
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $Path
+    } catch {
+        $null = $_
+        $fallbackDir = Join-Path $env:LOCALAPPDATA 'ClusterHost\state'
+        try { New-Item -Path $fallbackDir -ItemType Directory -Force -ErrorAction Stop | Out-Null } catch { $null = $_ }
+        return (Join-Path $fallbackDir (Split-Path -Leaf $Path))
+    }
+}
+
 function Invoke-DiscoverStage {
     <#
     .SYNOPSIS
@@ -80,20 +105,60 @@ function Invoke-DiscoverStage {
     )
 
     if (-not $PersistPath) { $PersistPath = Get-DefaultPersistPath }
+    $PersistPath = Confirm-PersistPathWritable -Path $PersistPath
+
+    $portsExplicit = $PSBoundParameters.ContainsKey('CandidatePorts')
     if (-not $CandidateNames -or $CandidateNames.Count -eq 0) { $CandidateNames = @('controller.local','controller') }
     if (-not $CandidatePorts -or $CandidatePorts.Count -eq 0) { $CandidatePorts = @(443) }
 
-    # Optional config override of port / extra candidate names.
-    if ($Config -and $Config.PSObject.Properties['controller'] -and $Config.controller) {
-        if ($Config.controller.PSObject.Properties['port'] -and $Config.controller.port) {
-            $CandidatePorts = @([int]$Config.controller.port)
+    # Optional config override of port. The explicit -CandidatePorts parameter
+    # (when supplied) WINS over -Config.controller.port so a caller that knows
+    # the port can override the config file.
+    if (-not $portsExplicit -and `
+        $Config -and $Config.PSObject.Properties['controller'] -and $Config.controller -and `
+        $Config.controller.PSObject.Properties['port'] -and $Config.controller.port) {
+        $CandidatePorts = @([int]$Config.controller.port)
+    }
+
+    # If -Config is supplied with a controller.address but no -ConfigPath,
+    # the underlying Find-Controller would skip the config-file branch.
+    # Emit a warning so the caller knows -Config alone is advisory for the
+    # port override and does NOT seed the address strategy.
+    if ($Config -and -not $ConfigPath -and `
+        $Config.PSObject.Properties['controller'] -and $Config.controller -and `
+        $Config.controller.PSObject.Properties['address'] -and $Config.controller.address) {
+        if (Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue) {
+            Write-ClusterLog -Level Warn -Stage 'discover' `
+                -Message "-Config.controller.address is ignored without -ConfigPath; pass -ConfigPath so Find-Controller can use the config-file strategy." `
+                -Data @{ address = "$($Config.controller.address)" }
         }
     }
 
-    $found = Find-Controller -ConfigPath $ConfigPath `
-                             -CandidateNames $CandidateNames `
-                             -CandidatePorts $CandidatePorts `
-                             -PersistPath $PersistPath
+    try {
+        $found = Find-Controller -ConfigPath $ConfigPath `
+                                 -CandidateNames $CandidateNames `
+                                 -CandidatePorts $CandidatePorts `
+                                 -PersistPath $PersistPath
+    } catch {
+        $exMsg = $_.Exception.Message
+        if (Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue) {
+            Write-ClusterLog -Level Error -Stage 'discover' `
+                -Message "Find-Controller threw -- treating as discovery failure." `
+                -ErrorRecord $_
+        }
+        return [pscustomobject]@{
+            Overall     = 'Fail'
+            Address     = $null
+            Source      = $null
+            Url         = $null
+            Port        = $null
+            Status      = $null
+            ConfigPath  = $ConfigPath
+            PersistPath = $PersistPath
+            Detail      = "Find-Controller threw: $exMsg"
+            Remediation = "Discovery threw an unhandled exception ($exMsg). Investigate the log file (lib/Logging.psm1 default path) and re-run."
+        }
+    }
 
     if ($found) {
         if (Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue) {

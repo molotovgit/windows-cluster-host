@@ -144,6 +144,58 @@ Describe 'Invoke-DiscoverStage' {
         $r.Source  | Should -Be 'dns:controller.local'
     }
 
+    It 'converts a Find-Controller exception into a structured Fail result' {
+        # Force the WriteDiscovered closure (which Find-Controller calls on
+        # the dns-strategy success path) to throw -- a real-world equivalent
+        # of access-denied on the persist directory.
+        $caps = Stub-AllInvoker `
+            -ResolveMap  @('controller.local','10.0.0.7') `
+            -TcpOk       @{ '10.0.0.7:443' = $true } `
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = 'MeshCentral' } }
+        & $script:Disc {
+            Set-DiscoveryInvoker -Name WriteDiscovered -ScriptBlock {
+                param([string]$Path, [hashtable]$Record)
+                throw [System.UnauthorizedAccessException]::new("simulated ACL deny: $Path")
+            }
+        }
+        $persist = Join-Path $script:tmpRoot 'persist-throwy.json'
+        $r = Invoke-DiscoverStage -PersistPath $persist 6>$null
+        $r.Overall     | Should -Be 'Fail'
+        $r.Detail      | Should -Match 'simulated ACL deny'
+        $r.Remediation | Should -Match 'log file'
+    }
+
+    It 'falls back to LOCALAPPDATA when the default ProgramData PersistPath is not writable' {
+        # Point PersistPath at a path under a directory we lock with deny-write ACL
+        # to force the writable-directory probe in Confirm-PersistPathWritable
+        # to fall back. We only need to assert the resulting PersistPath does
+        # not start with the locked directory.
+        $denyDir = Join-Path $script:tmpRoot ("lockdir-" + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -Path $denyDir -ItemType Directory -Force | Out-Null
+        $acl  = Get-Acl $denyDir
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+            'Write,CreateFiles,CreateDirectories','ContainerInherit,ObjectInherit','None','Deny')
+        $acl.SetAccessRule($rule)
+        Set-Acl -Path $denyDir -AclObject $acl
+
+        try {
+            $stuck = Join-Path $denyDir 'controller.json'
+            $caps  = Stub-AllInvoker `
+                -ResolveMap  @('controller.local','10.0.0.7') `
+                -TcpOk       @{ '10.0.0.7:443' = $true } `
+                -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = 'MeshCentral' } }
+            $r = Invoke-DiscoverStage -PersistPath $stuck 6>$null
+            $r.Overall     | Should -Be 'Pass'
+            $r.PersistPath | Should -Not -Be $stuck
+            $r.PersistPath | Should -Match 'ClusterHost'
+        } finally {
+            $acl.RemoveAccessRule($rule) | Out-Null
+            Set-Acl -Path $denyDir -AclObject $acl
+            Remove-Item -LiteralPath $denyDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It 'returns PersistPath in the result so the orchestrator can find the saved file' {
         $persist = Join-Path $script:tmpRoot 'persist-out.json'
         $caps = Stub-AllInvoker   # no resolution -> Fail, but PersistPath still surfaces
