@@ -178,6 +178,24 @@ Describe 'Invoke-ClusterHostSetup' {
         @($r.Stages | Where-Object { $_.Number -le 5 -and $_.Overall -eq 'Skipped' }).Count | Should -Be 5
     }
 
+    It 'catches a stage that THROWS and records Failed status with the exception detail' {
+        Stub-AllStage
+        # Hijack Stage 5 (Network) to throw mid-execution rather than return Fail.
+        Set-NetworkInvoker -Name GetVMSwitch -ScriptBlock { throw 'simulated stage crash' }
+        $r = Invoke-ClusterHostSetup -DryRun -NoRestart 6>$null
+        $r.Overall | Should -Be 'Fail'
+        $stage5 = $r.Stages | Where-Object Number -eq 5 | Select-Object -First 1
+        $stage5.Overall | Should -Be 'Fail'
+        $stage5.Detail  | Should -Match '^Threw:'
+        $stage5.Detail  | Should -Match 'simulated stage crash'
+        # Stages 6-8 must NOT have run.
+        @($r.Stages | Where-Object Number -ge 6).Count | Should -Be 0
+        # Status in registry should be Failed.
+        $status = Get-ClusterRunStatus
+        $status.Status    | Should -Be 'Failed'
+        $status.LastError | Should -Match 'simulated stage crash'
+    }
+
     It 'returns Overall=Fail and stops when Preflight returns Fail' {
         Stub-AllStage
         # Override the SKU detector to return Home -> Preflight Fail.

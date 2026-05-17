@@ -141,10 +141,10 @@ function Get-Plan {
     # orchestrator looks up each function by name via Get-Command at call
     # time -- closures over function references don't survive cross-scope
     # invocation cleanly in Pester / dot-source contexts.
-    param([pscustomobject]$Config,[string]$ConfigPath,[string]$OrchVersion,[switch]$DryRun)
+    param([pscustomobject]$Config,[string]$ConfigPath,[string]$OrchVersion,[switch]$DryRun,[string]$RegBase)
 
     $runId = $null
-    try { $s = Get-ClusterRunStatus; if ($s) { $runId = $s.RunId } } catch { $null = $_ }
+    try { $s = Get-ClusterRunStatus -RegBase $RegBase; if ($s) { $runId = $s.RunId } } catch { $null = $_ }
 
     @(
         @{ Number = 1; Name = 'Preflight';
@@ -218,11 +218,11 @@ function Invoke-ClusterHostSetup {
         }
 
         Set-ClusterRunVersion -Version $orchVersion -RegBase $RegBase
-        $plan = Get-Plan -Config $cfg -ConfigPath $ConfigPath -OrchVersion $orchVersion -DryRun:$DryRun
-
         # Pre-create a RunId via Save-StageMarker (it'll seed StartedAt etc.).
         # Save with the first stage we are actually about to run.
         Save-StageMarker -StageNumber $startAt -RegBase $RegBase
+        # Build the plan AFTER the marker so Stage 8 Verify gets the real RunId.
+        $plan = Get-Plan -Config $cfg -ConfigPath $ConfigPath -OrchVersion $orchVersion -DryRun:$DryRun -RegBase $RegBase
 
         foreach ($entry in $plan) {
             if ($entry.Number -lt $startAt) {
@@ -259,11 +259,19 @@ function Invoke-ClusterHostSetup {
                         $extraArgs = @()
                         if ($ConfigPath) { $extraArgs += @('-ConfigPath',"`"$ConfigPath`"") }
                         if ($DryRun)     { $extraArgs += '-DryRun' }
+                        if ($RegBase) { $extraArgs += @('-RegBase', $RegBase) }
                         Register-ResumeTask -OrchestratorPath $orchPath -ExtraArgs $extraArgs | Out-Null
+                        # Re-affirm InProgress so a previously-Failed run doesn't carry the
+                        # stale terminal state across the reboot.
+                        Set-ClusterRunStatus -Status InProgress -RegBase $RegBase
                         Write-ClusterLog -Level Warn -Stage 'orchestrator' -Message 'Restarting host now.'
-                        Stop-StageLog -Outcome Warning
+                        # Do NOT call Stop-StageLog here -- the inner 'Hyperv' stage was
+                        # already closed at the Stop-StageLog above, and the outer
+                        # 'orchestrator' frame is closed by the finally block.
                         Restart-Computer -Force
-                        return [pscustomobject]@{ Overall = 'RebootRequired'; Stages = $stageResults.ToArray(); StartedAt = $null; FinishedAt = $null; ElapsedSeconds = 0; RunId = (Get-ClusterRunStatus).RunId }
+                        $sw.Stop()
+                        return New-OrchResult -Overall 'RebootRequired' -StageResults $stageResults `
+                                              -ElapsedSeconds $sw.Elapsed.TotalSeconds -RegBase $RegBase
                     } else {
                         $sw.Stop()
                         Set-ClusterRunStatus -Status InProgress -RegBase $RegBase
@@ -317,7 +325,7 @@ function New-OrchResult {
         [Parameter(Mandatory)][double]$ElapsedSeconds,
         [string]$RegBase
     )
-    $status = Get-ClusterRunStatus -RegBase $RegBase
+    $status = Get-ClusterRunStatus -RegBase $RegBase   # already correctly forwarded
     return [pscustomobject]@{
         Overall        = $Overall
         Stages         = $StageResults.ToArray()
@@ -333,7 +341,7 @@ function New-OrchResult {
 # CLUSTERHOST_NOAUTORUN=1 to skip the auto-run block. The
 # $MyInvocation.InvocationName check ('-ne ''.''') is unreliable across
 # dot-source contexts so we use an explicit env var instead.
-if (-not $env:CLUSTERHOST_NOAUTORUN) {
+if ($env:CLUSTERHOST_NOAUTORUN -ne '1') {
     $result = Invoke-ClusterHostSetup `
         -ConfigPath $ConfigPath `
         -Resume:$Resume `
