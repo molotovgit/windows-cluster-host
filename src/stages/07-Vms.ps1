@@ -6,8 +6,18 @@
 .DESCRIPTION
     Sub-steps (each idempotent + per-step Status):
       1. Pick a VM storage drive (Get-PhysicalDriveBest)
-      2. Source the golden VHDX (SMB \\controller\images\golden.vhdx,
-         HTTPS https://controller/golden.vhdx, or a -LocalGoldenPath).
+      2. Source the golden VHDX. Three sources, tried in order:
+           - -LocalGoldenPath (operator pre-stage)
+           - SMB \\<controller>\<share>\<subdir>\<filename>
+             defaults: share='ClusterShare', subdir='vhdx',
+             filename='golden.vhdx' -- matches the layout
+             windows-cluster-controller's Stage 11 publishes.
+           - HTTPS <addr>/golden.vhdx (operator-served; not published by
+             default by windows-cluster-controller, kept as fallback for
+             custom deploys).
+         All four pieces (share, subdir, filename, https_url) are
+         overridable via Config.golden_vhdx.{smb_share, smb_subdir,
+         filename, https_url} OR via -GoldenSmbPath / -GoldenHttpsUrl.
          Verify SHA256 when -GoldenSha256 supplied.
       3. For each VM: clone golden -> <prefix><suffix>.vhdx if missing
       4. For each VM: New-VM (Gen2) attached to -SwitchName, dynamic mem
@@ -249,8 +259,23 @@ function Invoke-VmsStage {
         $Config.PSObject.Properties['controller'] -and $Config.controller -and `
         $Config.controller.PSObject.Properties['address'] -and $Config.controller.address) {
         $addr = "$($Config.controller.address)"
-        if (-not $GoldenSmbPath)  { $GoldenSmbPath  = "\\$addr\images\golden.vhdx" }
-        if (-not $GoldenHttpsUrl) { $GoldenHttpsUrl = "https://$addr/images/golden.vhdx" }
+        # Resolve share / subdir / filename / https_url with override
+        # precedence: explicit -GoldenSmbPath/-GoldenHttpsUrl > Config.golden_vhdx > defaults.
+        # Defaults match windows-cluster-controller's Stage 11 (Share)
+        # layout: share name 'ClusterShare', VHDX subdir 'vhdx',
+        # filename 'golden.vhdx' -> '\\<addr>\ClusterShare\vhdx\golden.vhdx'.
+        $gvCfg = if ($Config.PSObject.Properties['golden_vhdx']) { $Config.golden_vhdx } else { $null }
+        $smbShare = if ($gvCfg -and $gvCfg.PSObject.Properties['smb_share']  -and $gvCfg.smb_share)  { "$($gvCfg.smb_share)"  } else { 'ClusterShare' }
+        $smbSubdir = if ($gvCfg -and $gvCfg.PSObject.Properties['smb_subdir'] -and $gvCfg.smb_subdir) { "$($gvCfg.smb_subdir)" } else { 'vhdx' }
+        $vhdxFile  = if ($gvCfg -and $gvCfg.PSObject.Properties['filename']   -and $gvCfg.filename)   { "$($gvCfg.filename)"   } else { 'golden.vhdx' }
+        $httpsOverride = if ($gvCfg -and $gvCfg.PSObject.Properties['https_url'] -and $gvCfg.https_url) { "$($gvCfg.https_url)" } else { $null }
+        if (-not $GoldenSmbPath) {
+            $segments = @($smbShare, $smbSubdir, $vhdxFile) | Where-Object { $_ } | ForEach-Object { $_.Trim('\') }
+            $GoldenSmbPath = "\\$addr\" + ($segments -join '\')
+        }
+        if (-not $GoldenHttpsUrl) {
+            $GoldenHttpsUrl = if ($httpsOverride) { $httpsOverride } else { "https://$addr/$vhdxFile" }
+        }
     }
 
     $steps = New-Object System.Collections.Generic.List[object]
@@ -286,7 +311,7 @@ function Invoke-VmsStage {
         if (-not (Test-Path -LiteralPath $vmRoot)) { New-Item -Path $vmRoot -ItemType Directory -Force | Out-Null }
         $s = & $script:VmInvokers.SourceGoldenVhdx $GoldenSmbPath $GoldenHttpsUrl $LocalGoldenPath $goldenPath
         if (-not $s.Ok) {
-            Add-VmStep $steps 'Golden VHDX source' 'Fail' $s.Detail 'Verify the controller has \\controller\images\golden.vhdx OR https://controller/images/golden.vhdx, or pass -LocalGoldenPath.'
+            Add-VmStep $steps 'Golden VHDX source' 'Fail' $s.Detail "Drop a golden VHDX at $GoldenSmbPath on the controller (windows-cluster-controller publishes \\<addr>\ClusterShare\vhdx\ by default), or pass -LocalGoldenPath to install.ps1."
             return New-VmStageResult -Steps $steps -VmStorageDrive $VmStorageDrive -VmNames $names
         }
         Add-VmStep $steps 'Golden VHDX source' 'Pass' "Sourced via $($s.Source). $($s.Detail)"
