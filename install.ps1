@@ -267,21 +267,24 @@ if ($WriteConfig -and -not (Test-Path -LiteralPath $ConfigPath)) {
     Write-StarterConfig -Path $ConfigPath -Controller $ControllerAddress
 }
 
-# 3. Invoke the orchestrator.
+# 3. Invoke the orchestrator. Hashtable splat -- array splat would pass
+# '-ConfigPath' as a positional argument value rather than a parameter name.
 $orch = Join-Path $resolvedRoot 'src\Invoke-ClusterHostSetup.ps1'
-$orchArgs = @()
-$orchArgs += @('-ConfigPath', $ConfigPath)
-if ($Resume)     { $orchArgs += '-Resume' }
-if ($DryRun)     { $orchArgs += '-DryRun' }
-if ($NoRestart)  { $orchArgs += '-NoRestart' }
+$orchSplat = @{ ConfigPath = $ConfigPath }
+if ($Resume)    { $orchSplat['Resume']    = $true }
+if ($DryRun)    { $orchSplat['DryRun']    = $true }
+if ($NoRestart) { $orchSplat['NoRestart'] = $true }
 
 Write-Host ""
 Write-Host "== Launching orchestrator ==" -ForegroundColor Cyan
-Write-Host "  & $orch $($orchArgs -join ' ')" -ForegroundColor DarkGray
+$preview = "& $orch " + (($orchSplat.GetEnumerator() | ForEach-Object {
+    if ($_.Value -is [bool]) { "-$($_.Key)" } else { "-$($_.Key) $($_.Value)" }
+}) -join ' ')
+Write-Host "  $preview" -ForegroundColor DarkGray
 Write-Host ""
 
 try {
-    & $orch @orchArgs
+    & $orch @orchSplat
     $exit = $LASTEXITCODE
     if ($null -eq $exit) { $exit = 0 }
 } catch {
