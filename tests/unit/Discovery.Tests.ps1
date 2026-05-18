@@ -249,8 +249,100 @@ Describe 'Find-Controller strategy order' {
                 [pscustomobject]@{ IPAddress = '192.168.4.55';   PrefixLength = 24 }
             )
         Find-Controller -MaxSubnetScans 3 6>$null | Out-Null
-        # 3 candidates x 1 port = 3 TCP probes max (config probe didn't happen because no ConfigPath).
-        $caps.TcpCalls.Count | Should -BeLessOrEqual 3
+        # MaxSubnetScans caps the number of ADDRESSES; each is probed at the
+        # announcer port and the meshcentral port (2 TCP probes per address).
+        ($caps.TcpCalls | ForEach-Object { $_.Split(':')[0] } | Sort-Object -Unique).Count | Should -BeLessOrEqual 3
+    }
+}
+
+Describe 'Test-AnnouncerEndpoint (real-hardware bug 14: branded controller)' {
+
+    AfterEach { & $script:Disc { Reset-DiscoveryInvoker } }
+
+    It 'returns Ok=true when the announcer returns valid cluster-controller JSON' {
+        $caps = Set-AllOkInvoker `
+            -TcpOk      @{ '10.0.0.7:8765' = $true } `
+            -ProbeStatus @{ 'http://10.0.0.7:8765/.well-known/cluster-controller' = [pscustomobject]@{
+                Status = 200
+                Body   = '{"type":"cluster-controller","version":"0.1.0","hostname":"controller.lan","https_port":443}'
+            } }
+        $r = Test-AnnouncerEndpoint -Address '10.0.0.7' 6>$null
+        $r.Ok | Should -BeTrue
+        $r.Status | Should -Be 200
+        $r.Payload.type | Should -Be 'cluster-controller'
+        $r.Payload.hostname | Should -Be 'controller.lan'
+    }
+
+    It 'returns Ok=false when the JSON has the wrong type' {
+        $caps = Set-AllOkInvoker `
+            -TcpOk      @{ '10.0.0.7:8765' = $true } `
+            -ProbeStatus @{ 'http://10.0.0.7:8765/.well-known/cluster-controller' = [pscustomobject]@{
+                Status = 200; Body = '{"type":"something-else"}'
+            } }
+        $r = Test-AnnouncerEndpoint -Address '10.0.0.7' 6>$null
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Be 'announcer-type-mismatch'
+    }
+
+    It 'returns Ok=false reason=not-json on a non-JSON 200' {
+        $caps = Set-AllOkInvoker `
+            -TcpOk      @{ '10.0.0.7:8765' = $true } `
+            -ProbeStatus @{ 'http://10.0.0.7:8765/.well-known/cluster-controller' = [pscustomobject]@{
+                Status = 200; Body = '<html>not json</html>'
+            } }
+        $r = Test-AnnouncerEndpoint -Address '10.0.0.7' 6>$null
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Be 'not-json'
+    }
+
+    It 'returns Ok=false reason=tcp-closed when 8765 is not listening' {
+        $caps = Set-AllOkInvoker -TcpOk @{ '10.0.0.7:8765' = $false }
+        $r = Test-AnnouncerEndpoint -Address '10.0.0.7' 6>$null
+        $r.Ok | Should -BeFalse
+        $r.Reason | Should -Be 'tcp-closed'
+    }
+}
+
+Describe 'Find-Controller probes announcer before MeshCentral (real-hardware bug 14)' {
+
+    AfterEach { & $script:Disc { Reset-DiscoveryInvoker } }
+
+    It 'discovers a branded controller via the announcer when the MeshCentral marker is missing' {
+        # Regression for bug 14: operator rebranded the MeshCentral UI; the
+        # /-page body says "Cluster Controller" not "MeshCentral", so the
+        # legacy marker would have failed. The announcer payload is the
+        # robust signal.
+        $cfgPath = Join-Path $script:tmpRoot 'cfg-branded.json'
+        Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '192.168.1.22' } }) -Encoding utf8
+        $caps = Set-AllOkInvoker `
+            -TcpOk      @{ '192.168.1.22:8765' = $true; '192.168.1.22:443' = $true } `
+            -ProbeStatus @{
+                'http://192.168.1.22:8765/.well-known/cluster-controller' = [pscustomobject]@{
+                    Status = 200
+                    Body   = '{"type":"cluster-controller","version":"0.1.0","hostname":"controller.lan"}'
+                }
+                # MeshCentral marker is intentionally missing (branded UI).
+                'https://192.168.1.22:443/' = [pscustomobject]@{
+                    Status = 200; Body = '<title>Cluster Controller - Login</title>'
+                }
+            }
+        $r = Find-Controller -ConfigPath $cfgPath 6>$null
+        $r | Should -Not -BeNullOrEmpty
+        $r.Address | Should -Be '192.168.1.22'
+        $r.Source  | Should -Be 'config'
+        $r.Port    | Should -Be 8765
+    }
+
+    It 'falls back to the MeshCentral marker when the announcer port is closed' {
+        $cfgPath = Join-Path $script:tmpRoot 'cfg-legacy.json'
+        Set-Content -LiteralPath $cfgPath -Value (ConvertTo-Json @{ controller = @{ address = '10.0.0.7' } }) -Encoding utf8
+        $caps = Set-AllOkInvoker `
+            -TcpOk      @{ '10.0.0.7:8765' = $false; '10.0.0.7:443' = $true } `
+            -ProbeStatus @{ 'https://10.0.0.7:443/' = [pscustomobject]@{ Status = 200; Body = '<title>MeshCentral</title>' } }
+        $r = Find-Controller -ConfigPath $cfgPath 6>$null
+        $r.Address | Should -Be '10.0.0.7'
+        $r.Source  | Should -Be 'config'
+        $r.Port    | Should -Be 443
     }
 }
 
