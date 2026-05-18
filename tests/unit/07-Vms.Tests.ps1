@@ -16,19 +16,31 @@ BeforeAll {
     $script:tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("vms-stage-" + [guid]::NewGuid().ToString('N').Substring(0,8))
 
     function Set-VmStub {
-        param([bool]$SourceGoldenOk = $true,[bool]$CreateVmOk = $true)
+        param([bool]$SourceGoldenOk = $true,[bool]$CreateVmOk = $true,[bool]$SmbAuthOk = $true)
         Reset-VmInvoker
         $caps = [pscustomobject]@{
             Calls = New-Object System.Collections.Generic.List[string]
             Clones = New-Object System.Collections.Generic.List[string]
             Created = New-Object System.Collections.Generic.List[string]
             Autostart = New-Object System.Collections.Generic.List[string]
+            SmbOpenCalls  = New-Object System.Collections.Generic.List[string]
+            SmbCloseCalls = New-Object System.Collections.Generic.List[string]
         }
         Set-VmInvoker -Name SourceGoldenVhdx -ScriptBlock {
             param($smb,$https,$local,$dst)
             $caps.Calls.Add("SourceGoldenVhdx:$dst")
             if ($SourceGoldenOk) { @{ Ok = $true; Source = 'smb'; Detail = "copied to $dst" } }
             else                 { @{ Ok = $false; Source = 'none'; Detail = 'every source failed' } }
+        }.GetNewClosure()
+        Set-VmInvoker -Name OpenSmbAuth -ScriptBlock {
+            param($unc,$user,$pwd)
+            $caps.SmbOpenCalls.Add("$unc|$user")
+            if ($SmbAuthOk) { @{ Ok = $true; SharePath = '\\srv\share'; Detail = "auth ok as $user" } }
+            else            { @{ Ok = $false; SharePath = '\\srv\share'; Detail = 'auth failed' } }
+        }.GetNewClosure()
+        Set-VmInvoker -Name CloseSmbAuth -ScriptBlock {
+            param($sharePath)
+            $caps.SmbCloseCalls.Add("$sharePath")
         }.GetNewClosure()
         Set-VmInvoker -Name VerifyVhdxHash -ScriptBlock {
             param($p,$h)
@@ -172,6 +184,51 @@ Describe 'Invoke-VmsStage' {
         Invoke-VmsStage -Config $cfg -Count 1 6>$null | Out-Null
         $script:capturedSmb   | Should -Be '\\10.0.0.7\ClusterShare\vhdx\golden.vhdx'
         $script:capturedHttps | Should -Be 'https://10.0.0.7/golden.vhdx'
+    }
+
+    It 'mounts SMB with explicit creds when controller.smb_username is set (real-hardware bug 17)' {
+        # Regression for bug 17: in workgroup deploys the host PC's local
+        # user does not exist on the controller, so implicit SMB auth fails.
+        # When controller.smb_username + smb_password are present in the
+        # config, Stage 7 must call OpenSmbAuth (New-SmbMapping) before
+        # SourceGoldenVhdx and CloseSmbAuth in the finally block.
+        $caps = Set-VmStub -SourceGoldenOk $false   # short-circuit before VM steps
+        Set-HappyHardware
+        $cfg = [pscustomobject]@{
+            controller = [pscustomobject]@{
+                address      = '10.0.0.7'
+                smb_username = 'Agent'
+                smb_password = 'secret'
+            }
+        }
+        Invoke-VmsStage -Config $cfg -Count 1 6>$null | Out-Null
+        @($caps.SmbOpenCalls).Count  | Should -BeGreaterThan 0
+        @($caps.SmbOpenCalls)[0]     | Should -Match 'Agent$'
+        @($caps.SmbCloseCalls).Count | Should -BeGreaterThan 0
+    }
+
+    It 'does NOT mount SMB when controller.smb_username is absent (implicit auth path)' {
+        $caps = Set-VmStub -SourceGoldenOk $false
+        Set-HappyHardware
+        $cfg = [pscustomobject]@{ controller = [pscustomobject]@{ address = '10.0.0.7' } }
+        Invoke-VmsStage -Config $cfg -Count 1 6>$null | Out-Null
+        @($caps.SmbOpenCalls).Count  | Should -Be 0
+        @($caps.SmbCloseCalls).Count | Should -Be 0
+    }
+
+    It 'still unmounts even if SourceGoldenVhdx fails (cleanup robustness)' {
+        $caps = Set-VmStub -SourceGoldenOk $false
+        Set-HappyHardware
+        $cfg = [pscustomobject]@{
+            controller = [pscustomobject]@{
+                address      = '10.0.0.7'
+                smb_username = 'Agent'
+                smb_password = 'secret'
+            }
+        }
+        Invoke-VmsStage -Config $cfg -Count 1 6>$null | Out-Null
+        # Mount happened, copy failed, but unmount must still run (finally).
+        @($caps.SmbCloseCalls).Count | Should -BeGreaterThan 0
     }
 
     It 'honors Config.golden_vhdx overrides for share / subdir / filename' {
