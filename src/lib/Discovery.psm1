@@ -121,9 +121,16 @@ function Get-DefaultDiscoveryInvoker {
                 try { $body = "$($r.Content)" } catch { $body = '' }
                 return [pscustomobject]@{ Status = [int]$r.StatusCode; Body = $body }
             } catch {
-                if ($_.Exception.Response) {
-                    # Status reachable but error response; body usually empty here.
-                    return [pscustomobject]@{ Status = [int]$_.Exception.Response.StatusCode; Body = '' }
+                # Under StrictMode, $_.Exception.Response throws when the
+                # exception type has no Response property (DNS errors, TLS
+                # handshake failures, timeouts, connection-refused all produce
+                # HttpRequestException or its inner aggregate, none of which
+                # carry a Response). Probe safely via PSObject.Properties.
+                $ex = $_.Exception
+                $hasResp = $false
+                try { $hasResp = $null -ne $ex.PSObject.Properties['Response'] -and $null -ne $ex.Response } catch { $hasResp = $false }
+                if ($hasResp) {
+                    return [pscustomobject]@{ Status = [int]$ex.Response.StatusCode; Body = '' }
                 }
                 return $null
             }
