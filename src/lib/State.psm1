@@ -155,10 +155,20 @@ function Save-StageMarker {
     # StartedAt LAST. The presence of StartedAt is the durable signal that
     # the init block completed; a re-run after a crash will re-do the init
     # values (idempotent overwrite for RunId is fine -- diagnostics only).
-    if (-not (Get-RegValue -Path $RegBase -Name 'StartedAt')) {
+    #
+    # We also re-init when the prior Status is terminal (Completed/Failed):
+    # a fresh run on a host that already finished one should get a brand
+    # new RunId + StartedAt. The Resume-after-reboot path (Status=InProgress)
+    # keeps the existing RunId/StartedAt so the run identity carries
+    # across the reboot.
+    $priorStartedAt = Get-RegValue -Path $RegBase -Name 'StartedAt'
+    $priorStatus    = Get-RegValue -Path $RegBase -Name 'Status'
+    $isFreshRun     = (-not $priorStartedAt) -or ($priorStatus -in 'Completed','Failed')
+    if ($isFreshRun) {
         Write-RegValue -Path $RegBase -Name 'RunId'     -Value ([guid]::NewGuid().ToString())
         Write-RegValue -Path $RegBase -Name 'Status'    -Value 'InProgress'
         Write-RegValue -Path $RegBase -Name 'StartedAt' -Value (Get-NowIso)
+        Write-RegValue -Path $RegBase -Name 'LastError' -Value $null
         Write-ClusterLogIfAvailable -Level Info -Message "Run started" -Data @{ stage = $StageNumber; regBase = $RegBase }
     }
     Write-RegValue -Path $RegBase -Name 'Stage'     -Value $StageNumber -Type DWord

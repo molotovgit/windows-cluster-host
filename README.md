@@ -33,7 +33,27 @@ This repo is **half of a pair**. The companion repo, [`windows-cluster-controlle
 
 ## Status
 
-🚧 In active development.
+✅ All 8 stages implemented and unit + integration tested. End-to-end
+orchestrator dry-run passes Overall=Pass on a fully-stubbed Win11 Pro
+sandbox.
+
+**One-liner install** (paste under an elevated **pwsh** prompt):
+
+```powershell
+iwr -useb https://<controller>/install.ps1 | iex
+```
+
+Or from a local checkout (USB stick, share, git clone):
+
+```powershell
+.\install.ps1 -ControllerAddress 10.0.0.7 -WriteConfig
+```
+
+For a no-mutation preview:
+
+```powershell
+.\install.ps1 -ControllerAddress 10.0.0.7 -DryRun -NoRestart
+```
 
 Repo layout:
 
