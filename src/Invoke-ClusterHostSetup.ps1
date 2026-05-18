@@ -152,7 +152,7 @@ function Get-Plan {
            Splat = @{ Config = $Config; IgnoreFailures = [bool]$DryRun } }
         @{ Number = 2; Name = 'Discover';
            FunctionName = 'Invoke-DiscoverStage'
-           Splat = @{ Config = $Config; ConfigPath = $ConfigPath } }
+           Splat = @{ Config = $Config; ConfigPath = $ConfigPath; DryRun = [bool]$DryRun } }
         @{ Number = 3; Name = 'Tuning';
            FunctionName = 'Invoke-TuningStage'
            Splat = @{ DryRun = [bool]$DryRun } }

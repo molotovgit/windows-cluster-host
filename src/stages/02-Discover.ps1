@@ -101,7 +101,8 @@ function Invoke-DiscoverStage {
         $Config,
         [string]$PersistPath,
         [string[]]$CandidateNames,
-        [int[]]$CandidatePorts
+        [int[]]$CandidatePorts,
+        [switch]$DryRun
     )
 
     if (-not $PersistPath) { $PersistPath = Get-DefaultPersistPath }
@@ -202,6 +203,29 @@ function Invoke-DiscoverStage {
                 candidatePorts = ($CandidatePorts -join ',')
                 configPath     = $ConfigPath
             }
+    }
+
+    # In dry-run, a missing controller is NOT a fatal stage failure: the
+    # operator is previewing the host plan before the controller exists, so
+    # we want stages 3-8 to still get exercised. Surface the same diagnostic
+    # but at Warn-Overall=Skipped so the orchestrator continues.
+    if ($DryRun) {
+        if (Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue) {
+            Write-ClusterLog -Level Warn -Stage 'discover' `
+                -Message "Discover stage: no controller found, but -DryRun so the orchestrator will continue."
+        }
+        return [pscustomobject]@{
+            Overall     = 'Skipped'
+            Address     = $null
+            Source      = $null
+            Url         = $null
+            Port        = $null
+            Status      = $null
+            ConfigPath  = $ConfigPath
+            PersistPath = $PersistPath
+            Detail      = "-DryRun: no controller reachable yet; subsequent stages will run with a null controller address."
+            Remediation = $remediation
+        }
     }
 
     return [pscustomobject]@{
