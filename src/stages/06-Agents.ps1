@@ -140,11 +140,141 @@ function Get-DefaultAgentsInvoker {
                 return @{ Ok = $ok; ExitCode = $p.ExitCode; Detail = "Mesh Agent installer exit=$($p.ExitCode)." }
             } catch { return @{ Ok = $false; ExitCode = -1; Detail = "Start-Process threw: $($_.Exception.Message)" } }
         }
+        UninstallMeshAgent = {
+            # Run the existing agent's -fulluninstall to remove a leftover
+            # from a prior test / different controller. Idempotent: no-op
+            # if the binary isn't there.
+            $mh = 'C:\Program Files\Mesh Agent\MeshAgent.exe'
+            if (-not (Test-Path -LiteralPath $mh)) { return @{ Ok = $true; Detail = 'no prior MeshAgent.exe to uninstall' } }
+            try {
+                $p = Start-Process -FilePath $mh -ArgumentList '-fulluninstall' -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                Start-Sleep -Seconds 4
+                return @{ Ok = ($p.ExitCode -eq 0); ExitCode = $p.ExitCode; Detail = "-fulluninstall exit=$($p.ExitCode)" }
+            } catch { return @{ Ok = $false; ExitCode = -1; Detail = "-fulluninstall threw: $($_.Exception.Message)" } }
+        }
         GetMeshAgentService = {
             try {
                 $svc = Get-Service -Name 'Mesh Agent' -ErrorAction Stop
                 return @{ Found = $true; Status = "$($svc.Status)" }
             } catch { return @{ Found = $false; Status = 'NotInstalled' } }
+        }
+        # Read the agent .msh config that ships next to MeshAgent.exe. The
+        # installer writes this when -fullinstall runs; it records the
+        # MeshServer URL, MeshID, and ServerID this agent binds to. We use
+        # it to (a) detect a leftover agent bound to a DIFFERENT controller
+        # (bug 21) and (b) rewrite MeshServer=local to an explicit URL
+        # when mDNS discovery isn't reliable.
+        GetAgentMshConfig = {
+            param([string]$MshPath = 'C:\Program Files\Mesh Agent\MeshAgent.msh')
+            if (-not (Test-Path -LiteralPath $MshPath)) {
+                return [pscustomobject]@{ Found = $false; MeshServer = $null; MeshName = $null; Path = $MshPath }
+            }
+            $kv = @{}
+            foreach ($line in (Get-Content -LiteralPath $MshPath -ErrorAction SilentlyContinue)) {
+                if ($line -match '^\s*([^=#]+?)\s*=\s*(.*?)\s*$') {
+                    $kv[$Matches[1]] = $Matches[2]
+                }
+            }
+            return [pscustomobject]@{
+                Found      = $true
+                MeshServer = $kv['MeshServer']
+                MeshName   = $kv['MeshName']
+                MeshID     = $kv['MeshID']
+                ServerID   = $kv['ServerID']
+                Path       = $MshPath
+            }
+        }
+        # Rewrite MeshServer=local (mDNS discovery) to an explicit
+        # wss://<addr>:<port>/agent.ashx URL. Used when mDNS isn't routing
+        # (most workgroup / non-flat-LAN deploys). Returns @{Ok; Changed}.
+        SetAgentMshServer = {
+            param([string]$NewMeshServer, [string]$MshPath = 'C:\Program Files\Mesh Agent\MeshAgent.msh')
+            if (-not (Test-Path -LiteralPath $MshPath)) {
+                return @{ Ok = $false; Changed = $false; Detail = "MeshAgent.msh not at $MshPath" }
+            }
+            try {
+                $content = Get-Content -LiteralPath $MshPath -Raw
+                $new = $content -replace '(?m)^MeshServer\s*=\s*.+$', "MeshServer=$NewMeshServer"
+                if ($new -eq $content) {
+                    return @{ Ok = $true; Changed = $false; Detail = "MeshServer already matched $NewMeshServer" }
+                }
+                [System.IO.File]::WriteAllText($MshPath, $new, [System.Text.UTF8Encoding]::new($false))
+                return @{ Ok = $true; Changed = $true; Detail = "MeshServer rewritten to $NewMeshServer" }
+            } catch { return @{ Ok = $false; Changed = $false; Detail = "$($_.Exception.Message)" } }
+        }
+        # Open / close SMB authentication context for the controller share.
+        # Mirrors lib-level bug 17 in windows-cluster-host VMs stage.
+        OpenSmbAuth = {
+            param([string]$UncPath,[string]$User,[string]$Password)
+            if (-not $UncPath -or -not $User -or -not $Password) {
+                return @{ Ok = $false; SharePath = $null; Detail = 'no smb credentials supplied; using implicit auth' }
+            }
+            if ($UncPath -notmatch '^(\\\\[^\\]+\\[^\\]+)') {
+                return @{ Ok = $false; SharePath = $null; Detail = "'$UncPath' is not a UNC share path" }
+            }
+            $share = $Matches[1]
+            try {
+                $existing = Get-SmbMapping -RemotePath $share -ErrorAction SilentlyContinue
+                if ($existing) {
+                    Remove-SmbMapping -RemotePath $share -Force -UpdateProfile -ErrorAction SilentlyContinue
+                }
+                New-SmbMapping -RemotePath $share -UserName $User -Password $Password -ErrorAction Stop | Out-Null
+                return @{ Ok = $true; SharePath = $share; Detail = "Mounted $share as $User." }
+            } catch {
+                return @{ Ok = $false; SharePath = $share; Detail = "New-SmbMapping failed: $($_.Exception.Message)" }
+            }
+        }
+        CloseSmbAuth = {
+            param([string]$SharePath)
+            if (-not $SharePath) { return }
+            try { Remove-SmbMapping -RemotePath $SharePath -Force -UpdateProfile -ErrorAction SilentlyContinue }
+            catch { $null = $_ }
+        }
+        # Restart the Mesh Agent service after a .msh edit so it picks up
+        # the new MeshServer URL.
+        RestartMeshAgentService = {
+            param([int]$WaitSec = 15)
+            try {
+                Stop-Service 'Mesh Agent' -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+                Start-Service 'Mesh Agent' -ErrorAction Stop
+                $deadline = (Get-Date).AddSeconds($WaitSec)
+                while ((Get-Date) -lt $deadline) {
+                    $svc = Get-Service 'Mesh Agent' -ErrorAction SilentlyContinue
+                    if ($svc -and $svc.Status -eq 'Running') {
+                        return @{ Ok = $true; Detail = 'Mesh Agent restarted, Status=Running' }
+                    }
+                    Start-Sleep -Milliseconds 500
+                }
+                return @{ Ok = $false; Detail = "Mesh Agent did not reach Running within ${WaitSec}s" }
+            } catch { return @{ Ok = $false; Detail = "Restart failed: $($_.Exception.Message)" } }
+        }
+        # Verify the Mesh Agent has an established TCP connection to a
+        # SPECIFIC controller address:port. Returns @{Connected; Detail}
+        # so the stage can distinguish "bound to OUR controller" from
+        # "bound to some other MeshCentral server".
+        TestAgentConnectedTo = {
+            param([string]$ExpectedAddress, [int]$ExpectedPort, [int]$WaitSec = 30)
+            $deadline = (Get-Date).AddSeconds($WaitSec)
+            while ((Get-Date) -lt $deadline) {
+                $proc = Get-Process MeshAgent -ErrorAction SilentlyContinue
+                if ($proc) {
+                    $conns = @(Get-NetTCPConnection -OwningProcess $proc.Id -State Established -ErrorAction SilentlyContinue |
+                               Where-Object { $_.RemoteAddress -eq $ExpectedAddress -and $_.RemotePort -eq $ExpectedPort })
+                    if ($conns.Count -gt 0) {
+                        return @{ Connected = $true; Detail = "Established to ${ExpectedAddress}:$ExpectedPort" }
+                    }
+                }
+                Start-Sleep -Milliseconds 750
+            }
+            $proc = Get-Process MeshAgent -ErrorAction SilentlyContinue
+            $where = if ($proc) {
+                $other = @(Get-NetTCPConnection -OwningProcess $proc.Id -State Established -ErrorAction SilentlyContinue |
+                           Select-Object @{N='r';E={"$($_.RemoteAddress):$($_.RemotePort)"}} |
+                           Select-Object -ExpandProperty r) -join ', '
+                if ($other) { "(currently connected to: $other)" } else { '(no established connections)' }
+            } else { '(MeshAgent process not running)' }
+            return @{ Connected = $false; Detail = "did not observe connection to ${ExpectedAddress}:$ExpectedPort within ${WaitSec}s $where" }
         }
     }
 }
@@ -263,50 +393,140 @@ function Invoke-AgentsStage {
     }
 
     # ---------- MeshAgent ----------
+    # Bug 21: previously this block only checked 'is the Mesh Agent service
+    # running?' and called it a Pass. That accepts a leftover agent bound to
+    # a DIFFERENT MeshCentral (e.g. a public meshcentral.com test). The
+    # rewrite below: download the controller-specific installer from OUR
+    # controller's SMB share, uninstall any leftover bound elsewhere, run
+    # -fullinstall, rewrite MeshServer=local -> explicit URL when needed,
+    # then VERIFY there is an established TCP connection to our controller.
     if ($SkipMeshAgent) {
         Add-AgentStep $steps 'MeshAgent' 'Skipped' '-SkipMeshAgent specified.'
     } else {
-        # Pull controller info from -Config if not explicitly supplied.
-        if ((-not $MeshAgentSmbPath -or -not $MeshAgentHttpsUrl) -and `
-            $Config -and $Config.PSObject.Properties['controller'] -and $Config.controller -and `
-            $Config.controller.PSObject.Properties['address'] -and $Config.controller.address) {
-            $addr = "$($Config.controller.address)"
-            if (-not $MeshAgentSmbPath)   { $MeshAgentSmbPath   = "\\$addr\images\meshagent.exe" }
-            if (-not $MeshAgentHttpsUrl)  { $MeshAgentHttpsUrl  = "https://$addr/meshagents?id=4" }
+        # Resolve config-driven controller address / port / group / share /
+        # SMB creds (mirrors VMs stage bug-17 design).
+        $cfgController = if ($Config -and $Config.PSObject.Properties['controller']) { $Config.controller } else { $null }
+        $addr = if ($cfgController -and $cfgController.PSObject.Properties['address']) { "$($cfgController.address)" } else { $null }
+        $port = if ($cfgController -and $cfgController.PSObject.Properties['port'] -and $cfgController.port) {
+                    [int]$cfgController.port
+                } else { 443 }
+        $smbUser = if ($cfgController -and $cfgController.PSObject.Properties['smb_username'] -and $cfgController.smb_username) {
+                       "$($cfgController.smb_username)"
+                   } else { $null }
+        $smbPass = if ($cfgController -and $cfgController.PSObject.Properties['smb_password'] -and $cfgController.smb_password) {
+                       "$($cfgController.smb_password)"
+                   } else { $null }
+        $cfgAgent = if ($Config -and $Config.PSObject.Properties['agent']) { $Config.agent } else { $null }
+        $smbShare  = if ($cfgAgent -and $cfgAgent.PSObject.Properties['smb_share']  -and $cfgAgent.smb_share)  { "$($cfgAgent.smb_share)"  } else { 'ClusterShare' }
+        $group     = if ($cfgAgent -and $cfgAgent.PSObject.Properties['group']      -and $cfgAgent.group)      { "$($cfgAgent.group)"      } else { 'cluster-hosts' }
+        $smbSubdir = if ($cfgAgent -and $cfgAgent.PSObject.Properties['smb_subdir'] -and $cfgAgent.smb_subdir) { "$($cfgAgent.smb_subdir)" } else { "agents\$group" }
+        $fileName  = if ($cfgAgent -and $cfgAgent.PSObject.Properties['filename']   -and $cfgAgent.filename)   { "$($cfgAgent.filename)"   } else { "meshagent64-$group.exe" }
+        if (-not $MeshAgentSmbPath -and $addr) {
+            $segments = @($smbShare, $smbSubdir, $fileName) | Where-Object { $_ } | ForEach-Object { $_.Trim('\') }
+            $MeshAgentSmbPath = "\\$addr\" + ($segments -join '\')
         }
+        if (-not $MeshAgentHttpsUrl -and $addr) {
+            $MeshAgentHttpsUrl = "https://$addr/meshagents?id=4"
+        }
+        $expectedMeshServer = if ($addr) { "wss://${addr}:${port}/agent.ashx" } else { $null }
+
         $existing = & $script:AgentsInvokers.GetMeshAgentService
-        if ($existing.Found -and $existing.Status -eq 'Running') {
-            Add-AgentStep $steps 'MeshAgent' 'Pass' "Mesh Agent service already Running."
-        } elseif ($DryRun) {
-            Add-AgentStep $steps 'MeshAgent' 'Skipped' "DryRun: would download from $MeshAgentSmbPath / $MeshAgentHttpsUrl and run -fullinstall."
-        } elseif (-not $MeshAgentSmbPath -and -not $MeshAgentHttpsUrl) {
-            Add-AgentStep $steps 'MeshAgent' 'Warn' 'No -MeshAgentSmbPath/HttpsUrl and no controller.address in config; skipped install.' 'Provide controller address or pass -MeshAgentSmbPath / -MeshAgentHttpsUrl.'
+
+        if ($DryRun) {
+            Add-AgentStep $steps 'MeshAgent' 'Skipped' "DryRun: would source from $MeshAgentSmbPath / $MeshAgentHttpsUrl, install, verify connection to ${addr}:$port."
+        } elseif (-not $addr) {
+            Add-AgentStep $steps 'MeshAgent' 'Warn' 'No controller.address in config and no -MeshAgentSmbPath supplied; cannot verify which controller to bind to.' 'Set controller.address in cluster-config.json or pass -MeshAgentSmbPath / -MeshAgentHttpsUrl.'
         } else {
-            $d = & $script:AgentsInvokers.DownloadMeshAgent $MeshAgentSmbPath $MeshAgentHttpsUrl $MeshAgentDestination
-            if (-not $d.Ok) {
-                $smbDisplay   = if ($MeshAgentSmbPath)  { $MeshAgentSmbPath }  else { '<none>' }
-                $httpsDisplay = if ($MeshAgentHttpsUrl) { $MeshAgentHttpsUrl } else { '<none>' }
-                Add-AgentStep $steps 'MeshAgent download' 'Fail' $d.Detail "Verify the controller is reachable at $smbDisplay or $httpsDisplay."
-            } else {
-                Add-AgentStep $steps 'MeshAgent download' 'Pass' "Downloaded (source=$($d.Source)). $($d.Detail)"
-                $v = & $script:AgentsInvokers.VerifyMeshAgentHash $MeshAgentDestination $MeshAgentSha256
-                if ($v.Ok) {
-                    if ($v.Skipped) { Add-AgentStep $steps 'MeshAgent SHA256' 'Warn' $v.Detail 'Provide -MeshAgentSha256 to enable integrity verification.' }
-                    else            { Add-AgentStep $steps 'MeshAgent SHA256' 'Pass' $v.Detail }
-                    $ins = & $script:AgentsInvokers.InstallMeshAgent $MeshAgentDestination
-                    if ($ins.Ok) {
-                        $svc = & $script:AgentsInvokers.GetMeshAgentService
-                        if ($svc.Found -and $svc.Status -eq 'Running') {
-                            Add-AgentStep $steps 'MeshAgent install' 'Pass' "Installed; Mesh Agent service $($svc.Status)."
-                        } else {
-                            Add-AgentStep $steps 'MeshAgent install' 'Warn' "Installer exit=0 but Mesh Agent service status=$($svc.Status). Wait 30s and re-check; service registration is async." 'Get-Service ''Mesh Agent''; if Stopped, Start-Service ''Mesh Agent''.'
-                        }
+            # Decide: is there a leftover agent bound to a DIFFERENT controller?
+            $needsReinstall = $true
+            if ($existing.Found) {
+                $msh = & $script:AgentsInvokers.GetAgentMshConfig
+                if ($msh.Found -and $msh.MeshName -eq $group) {
+                    # Existing agent's group matches; check live connection too.
+                    $live = & $script:AgentsInvokers.TestAgentConnectedTo $addr $port 3
+                    if ($live.Connected) {
+                        Add-AgentStep $steps 'MeshAgent' 'Pass' "Already installed, group='$group', connected to ${addr}:$port."
+                        $needsReinstall = $false
                     } else {
-                        Add-AgentStep $steps 'MeshAgent install' 'Fail' $ins.Detail "Run installer manually: '$MeshAgentDestination' -fullinstall"
+                        Add-AgentStep $steps 'MeshAgent existing' 'Warn' "Found existing Mesh Agent (group='$($msh.MeshName)') but not connected to ${addr}:$port; will reinstall."
                     }
-                } else {
-                    Add-AgentStep $steps 'MeshAgent SHA256' 'Fail' $v.Detail 'Re-download from a trusted source or verify the controller has the matching installer.'
+                } elseif ($msh.Found) {
+                    Add-AgentStep $steps 'MeshAgent existing' 'Warn' "Found Mesh Agent bound to OTHER group '$($msh.MeshName)' / server '$($msh.MeshServer)'; uninstalling before binding to '$group'."
                 }
+            }
+
+            if ($needsReinstall) {
+                if ($existing.Found) {
+                    $un = & $script:AgentsInvokers.UninstallMeshAgent
+                    if ($un.Ok) {
+                        Add-AgentStep $steps 'MeshAgent uninstall (prior)' 'Pass' $un.Detail
+                    } else {
+                        Add-AgentStep $steps 'MeshAgent uninstall (prior)' 'Warn' $un.Detail
+                    }
+                }
+
+                # SMB auth (workgroup deploys need explicit controller creds).
+                $smbAuthState = $null
+                if ($MeshAgentSmbPath -and $smbUser -and $smbPass) {
+                    $smbAuthState = & $script:AgentsInvokers.OpenSmbAuth $MeshAgentSmbPath $smbUser $smbPass
+                    if ($smbAuthState.Ok) {
+                        Add-AgentStep $steps 'SMB auth to controller' 'Pass' $smbAuthState.Detail
+                    } else {
+                        Add-AgentStep $steps 'SMB auth to controller' 'Warn' $smbAuthState.Detail 'Continuing with implicit auth; SMB Copy-Item may fail.'
+                    }
+                }
+                try {
+                    $d = & $script:AgentsInvokers.DownloadMeshAgent $MeshAgentSmbPath $MeshAgentHttpsUrl $MeshAgentDestination
+                } finally {
+                    if ($smbAuthState -and $smbAuthState.Ok -and $smbAuthState.SharePath) {
+                        & $script:AgentsInvokers.CloseSmbAuth $smbAuthState.SharePath
+                    }
+                }
+                if (-not $d.Ok) {
+                    Add-AgentStep $steps 'MeshAgent download' 'Fail' $d.Detail "Verify $MeshAgentSmbPath exists on the controller and SMB auth (controller.smb_username/smb_password) is correct."
+                } else {
+                    Add-AgentStep $steps 'MeshAgent download' 'Pass' "Downloaded (source=$($d.Source)). $($d.Detail)"
+                    $v = & $script:AgentsInvokers.VerifyMeshAgentHash $MeshAgentDestination $MeshAgentSha256
+                    if (-not $v.Ok) {
+                        Add-AgentStep $steps 'MeshAgent SHA256' 'Fail' $v.Detail 'Re-download from a trusted source or verify the controller has the matching installer.'
+                    } else {
+                        if ($v.Skipped) {
+                            Add-AgentStep $steps 'MeshAgent SHA256' 'Warn' $v.Detail 'Provide -MeshAgentSha256 to enable integrity verification.'
+                        } else {
+                            Add-AgentStep $steps 'MeshAgent SHA256' 'Pass' $v.Detail
+                        }
+                        $ins = & $script:AgentsInvokers.InstallMeshAgent $MeshAgentDestination
+                        if (-not $ins.Ok) {
+                            Add-AgentStep $steps 'MeshAgent install' 'Fail' $ins.Detail "Run installer manually: '$MeshAgentDestination' -fullinstall"
+                        } else {
+                            Add-AgentStep $steps 'MeshAgent install' 'Pass' $ins.Detail
+                            # If the .msh shipped with MeshServer=local (mDNS
+                            # auto-discovery) and we have an explicit address,
+                            # rewrite to the explicit URL so cross-subnet /
+                            # mDNS-blocked LANs still work.
+                            $msh2 = & $script:AgentsInvokers.GetAgentMshConfig
+                            if ($msh2.Found -and $msh2.MeshServer -eq 'local' -and $expectedMeshServer) {
+                                $set = & $script:AgentsInvokers.SetAgentMshServer $expectedMeshServer
+                                if ($set.Changed) {
+                                    $restart = & $script:AgentsInvokers.RestartMeshAgentService 20
+                                    Add-AgentStep $steps 'MeshAgent .msh rewrite' 'Pass' "$($set.Detail); $($restart.Detail)"
+                                } else {
+                                    Add-AgentStep $steps 'MeshAgent .msh rewrite' 'Pass' $set.Detail
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            # Final verification: regardless of whether we reinstalled or
+            # accepted the existing agent, the bug-21 contract is that we
+            # have to observe an established connection to OUR controller.
+            $verify = & $script:AgentsInvokers.TestAgentConnectedTo $addr $port 30
+            if ($verify.Connected) {
+                Add-AgentStep $steps 'MeshAgent connection verify' 'Pass' $verify.Detail
+            } else {
+                Add-AgentStep $steps 'MeshAgent connection verify' 'Warn' $verify.Detail 'mDNS may not be routing; check controller firewall, or edit MeshAgent.msh to set MeshServer=wss://<addr>:<port>/agent.ashx and restart the Mesh Agent service.'
             }
         }
     }
