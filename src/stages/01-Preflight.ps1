@@ -139,7 +139,10 @@ function Invoke-PreflightStage {
         vms.min_disk_gb_per_vm. Optional -- defaults applied when missing.
 
     .PARAMETER MinRamGb
-        Minimum required RAM in GB. Default 16.
+        Minimum required RAM in GB. Default 14 -- a 16 GB stick typically
+        reports 15.8 GB because firmware reserves a couple hundred MB for the
+        iGPU / management engine. 14 GB lets a 16 GB stick pass while still
+        catching machines with significantly less.
 
     .PARAMETER MinPwshVersion
         Minimum PowerShell version. Default 7.0.
@@ -155,7 +158,7 @@ function Invoke-PreflightStage {
     [CmdletBinding()]
     param(
         $Config,
-        [int]$MinRamGb = 16,
+        [int]$MinRamGb = 14,
         [version]$MinPwshVersion = '7.0',
         [switch]$IgnoreFailures
     )
