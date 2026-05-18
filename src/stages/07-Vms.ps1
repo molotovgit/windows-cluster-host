@@ -142,6 +142,39 @@ function Get-DefaultVmInvoker {
                 return @{ Ok = $true; Detail = "Autostart=Start, Delay=$DelaySeconds s." }
             } catch { return @{ Ok = $false; Detail = "Set-VM autostart failed: $($_.Exception.Message)" } }
         }
+        # Mount the controller's SMB share with explicit credentials. Required
+        # in workgroup deploys where the host's local user does not exist on
+        # the controller; the implicit-creds Copy-Item would otherwise be
+        # rejected by the share's "Authenticated Users" ACL.
+        OpenSmbAuth = {
+            param([string]$UncPath,[string]$User,[string]$Password)
+            if (-not $UncPath -or -not $User -or -not $Password) {
+                return @{ Ok = $false; SharePath = $null; Detail = 'no smb credentials supplied; using implicit auth' }
+            }
+            # Extract '\\server\share' root from a longer UNC path.
+            if ($UncPath -notmatch '^(\\\\[^\\]+\\[^\\]+)') {
+                return @{ Ok = $false; SharePath = $null; Detail = "'$UncPath' is not a UNC share path" }
+            }
+            $share = $Matches[1]
+            try {
+                # Idempotent: remove any stale mapping first so a prior-run
+                # cached credential doesn't conflict with the explicit one.
+                $existing = Get-SmbMapping -RemotePath $share -ErrorAction SilentlyContinue
+                if ($existing) {
+                    Remove-SmbMapping -RemotePath $share -Force -UpdateProfile -ErrorAction SilentlyContinue
+                }
+                New-SmbMapping -RemotePath $share -UserName $User -Password $Password -ErrorAction Stop | Out-Null
+                return @{ Ok = $true; SharePath = $share; Detail = "Mounted $share as $User." }
+            } catch {
+                return @{ Ok = $false; SharePath = $share; Detail = "New-SmbMapping failed: $($_.Exception.Message)" }
+            }
+        }
+        CloseSmbAuth = {
+            param([string]$SharePath)
+            if (-not $SharePath) { return }
+            try { Remove-SmbMapping -RemotePath $SharePath -Force -UpdateProfile -ErrorAction SilentlyContinue }
+            catch { $null = $_ }
+        }
     }
 }
 
@@ -217,6 +250,8 @@ function Invoke-VmsStage {
         [string]$GoldenHttpsUrl,
         [string]$LocalGoldenPath,
         [string]$GoldenSha256,
+        [string]$ControllerSmbUser,
+        [string]$ControllerSmbPassword,
         [int]$Count,
         [string]$Prefix,
         [string[]]$Suffixes,
@@ -278,6 +313,20 @@ function Invoke-VmsStage {
         }
     }
 
+    # Resolve SMB credentials. Required in workgroup deploys (host's local
+    # user does not exist on the controller). Precedence: explicit params
+    # > Config.controller.smb_username/smb_password > none (implicit auth).
+    if (-not $ControllerSmbUser -and $Config -and `
+        $Config.PSObject.Properties['controller'] -and $Config.controller -and `
+        $Config.controller.PSObject.Properties['smb_username'] -and $Config.controller.smb_username) {
+        $ControllerSmbUser = "$($Config.controller.smb_username)"
+    }
+    if (-not $ControllerSmbPassword -and $Config -and `
+        $Config.PSObject.Properties['controller'] -and $Config.controller -and `
+        $Config.controller.PSObject.Properties['smb_password'] -and $Config.controller.smb_password) {
+        $ControllerSmbPassword = "$($Config.controller.smb_password)"
+    }
+
     $steps = New-Object System.Collections.Generic.List[object]
     $names = Get-VmNameList -Count $Count -Prefix $Prefix -Suffixes $Suffixes
 
@@ -309,9 +358,28 @@ function Invoke-VmsStage {
         Add-VmStep $steps 'Golden VHDX source' 'Pass' "Golden VHDX already present at $goldenPath; not re-downloading."
     } else {
         if (-not (Test-Path -LiteralPath $vmRoot)) { New-Item -Path $vmRoot -ItemType Directory -Force | Out-Null }
-        $s = & $script:VmInvokers.SourceGoldenVhdx $GoldenSmbPath $GoldenHttpsUrl $LocalGoldenPath $goldenPath
+
+        # Mount the controller's SMB share with explicit creds if supplied
+        # (workgroup deploys need this; domain-joined deploys can rely on
+        # implicit auth). The mapping is cleaned up in the finally block.
+        $smbAuthState = $null
+        if ($GoldenSmbPath -and $ControllerSmbUser -and $ControllerSmbPassword) {
+            $smbAuthState = & $script:VmInvokers.OpenSmbAuth $GoldenSmbPath $ControllerSmbUser $ControllerSmbPassword
+            if ($smbAuthState.Ok) {
+                Add-VmStep $steps 'SMB auth to controller' 'Pass' $smbAuthState.Detail
+            } else {
+                Add-VmStep $steps 'SMB auth to controller' 'Warn' $smbAuthState.Detail 'Continuing with implicit credentials; SMB Copy-Item may fail.'
+            }
+        }
+        try {
+            $s = & $script:VmInvokers.SourceGoldenVhdx $GoldenSmbPath $GoldenHttpsUrl $LocalGoldenPath $goldenPath
+        } finally {
+            if ($smbAuthState -and $smbAuthState.Ok -and $smbAuthState.SharePath) {
+                & $script:VmInvokers.CloseSmbAuth $smbAuthState.SharePath
+            }
+        }
         if (-not $s.Ok) {
-            Add-VmStep $steps 'Golden VHDX source' 'Fail' $s.Detail "Drop a golden VHDX at $GoldenSmbPath on the controller (windows-cluster-controller publishes \\<addr>\ClusterShare\vhdx\ by default), or pass -LocalGoldenPath to install.ps1."
+            Add-VmStep $steps 'Golden VHDX source' 'Fail' $s.Detail "Drop a golden VHDX at $GoldenSmbPath on the controller (windows-cluster-controller publishes \\<addr>\ClusterShare\vhdx\ by default), or pass -LocalGoldenPath to install.ps1. If the share auth is rejecting the host, set controller.smb_username/smb_password in cluster-config.json."
             return New-VmStageResult -Steps $steps -VmStorageDrive $VmStorageDrive -VmNames $names
         }
         Add-VmStep $steps 'Golden VHDX source' 'Pass' "Sourced via $($s.Source). $($s.Detail)"
