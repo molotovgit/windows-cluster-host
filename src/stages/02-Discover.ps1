@@ -147,8 +147,13 @@ function Invoke-DiscoverStage {
                 -Message "Find-Controller threw -- treating as discovery failure." `
                 -ErrorRecord $_
         }
+        # In dry-run, an unhandled discovery exception is also a soft-skip,
+        # not a hard halt -- the operator is previewing the plan, not yet
+        # connected to a real controller. The full diagnostic still lands
+        # in the log.
+        $overall = if ($DryRun) { 'Skipped' } else { 'Fail' }
         return [pscustomobject]@{
-            Overall     = 'Fail'
+            Overall     = $overall
             Address     = $null
             Source      = $null
             Url         = $null
@@ -156,7 +161,7 @@ function Invoke-DiscoverStage {
             Status      = $null
             ConfigPath  = $ConfigPath
             PersistPath = $PersistPath
-            Detail      = "Find-Controller threw: $exMsg"
+            Detail      = if ($DryRun) { "-DryRun: Find-Controller threw ($exMsg). Continuing." } else { "Find-Controller threw: $exMsg" }
             Remediation = "Discovery threw an unhandled exception ($exMsg). Investigate the log file (lib/Logging.psm1 default path) and re-run."
         }
     }
