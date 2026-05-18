@@ -201,6 +201,71 @@ function Test-ProbeOk {
     return ($Status -ge 200 -and $Status -lt 400) -or ($Status -eq 401)
 }
 
+function Test-AnnouncerEndpoint {
+    <#
+    .SYNOPSIS
+        Probe the cluster-controller announcer's well-known HTTP endpoint
+        (port 8765 by default, path /.well-known/cluster-controller).
+        This is the canonical "I am a controller" signal -- the announcer
+        is written by windows-cluster-controller's Stage 12 and returns
+        JSON like {"type":"cluster-controller","version":"0.1.0",...}.
+
+    .DESCRIPTION
+        Prefer this over Test-ControllerEndpoint when the host is looking
+        for a windows-cluster-controller specifically. The MeshCentral
+        login HTML page can be re-branded by the operator (title +
+        copyright string set via cluster-config.json), so a 'meshcentral'
+        marker regex on the body is unreliable. The announcer payload is
+        structured JSON we control and is robust to branding.
+
+    .OUTPUTS
+        pscustomobject @{ Ok; Status; Url; Reason; Payload }
+        Payload is the parsed JSON pscustomobject when Ok=$true; $null
+        otherwise. Reason is one of:
+          'ok' | 'tcp-closed' | 'no-response' | 'http-<NNN>' | 'empty-body'
+          | 'not-json' | 'announcer-type-mismatch'.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Address,
+        [int]$Port = 8765,
+        [string]$ProbePath = '/.well-known/cluster-controller',
+        [int]$TcpTimeoutMs = 750,
+        [int]$HttpTimeoutSec = 4
+    )
+    $url = "http://$Address`:$Port$ProbePath"
+    $tcpOk = & $script:DiscoveryInvokers.TestTcp $Address $Port $TcpTimeoutMs
+    if (-not $tcpOk) {
+        return [pscustomobject]@{ Ok = $false; Status = $null; Url = $url; Reason = 'tcp-closed'; Payload = $null }
+    }
+    $resp = & $script:DiscoveryInvokers.HttpProbe $url $HttpTimeoutSec
+    if ($null -eq $resp) {
+        return [pscustomobject]@{ Ok = $false; Status = $null; Url = $url; Reason = 'no-response'; Payload = $null }
+    }
+    $status = $resp.Status
+    $body   = if ($resp.PSObject.Properties['Body']) { "$($resp.Body)" } else { '' }
+    if (-not (Test-ProbeOk $status)) {
+        return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = "http-$status"; Payload = $null }
+    }
+    if (-not $body) {
+        return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = 'empty-body'; Payload = $null }
+    }
+    $payload = $null
+    try { $payload = $body | ConvertFrom-Json -ErrorAction Stop }
+    catch {
+        $null = $_
+        return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = 'not-json'; Payload = $null }
+    }
+    $typeOk = $false
+    if ($payload -and $payload.PSObject.Properties['type']) {
+        $typeOk = "$($payload.type)" -eq 'cluster-controller'
+    }
+    if (-not $typeOk) {
+        return [pscustomobject]@{ Ok = $false; Status = $status; Url = $url; Reason = 'announcer-type-mismatch'; Payload = $payload }
+    }
+    return [pscustomobject]@{ Ok = $true; Status = $status; Url = $url; Reason = 'ok'; Payload = $payload }
+}
+
 function Test-ControllerEndpoint {
     <#
     .SYNOPSIS
@@ -211,7 +276,10 @@ function Test-ControllerEndpoint {
     .PARAMETER MeshCentralMarker
         Regex tested case-insensitively against the response body. Default
         '(?i)meshcentral' -- MeshCentral's default login page includes the
-        product name in title, scripts, and copyright notice.
+        product name in title, scripts, and copyright notice. Operators
+        who rebrand the page (custom title/copyright) should use
+        Test-AnnouncerEndpoint instead; it doesn't depend on the body
+        text and probes a JSON well-known endpoint.
 
     .OUTPUTS
         pscustomobject @{ Ok; Status; Url; Reason }
@@ -326,15 +394,44 @@ function Find-Controller {
         [string[]]$CandidateNames = @('controller.local','controller'),
         [int[]]$CandidatePorts    = @(443),
         [string]$ProbePath        = '/',
+        [int]$AnnouncerPort       = 8765,
         [string]$PersistPath,
         [int]$MaxSubnetScans      = 16,
         [int[]]$LastOctetsForScan = @(1, 10, 100, 254)
     )
 
     # Helper -- given an Address candidate and the strategy label, probe and
-    # build the success record if it answers.
+    # build the success record if it answers. We probe in two passes:
+    #   1. Announcer (HTTP :8765 /.well-known/cluster-controller) -- canonical
+    #      "I am a windows-cluster-controller" signal, robust to MeshCentral
+    #      UI rebranding.
+    #   2. MeshCentral HTTPS marker probe -- legacy fallback for controllers
+    #      built without the announcer (older deploys) or where 8765 is
+    #      firewalled.
     function Confirm-Candidate {
         param([string]$Address, [string]$Source)
+
+        # Pass 1: announcer
+        $ann = Test-AnnouncerEndpoint -Address $Address -Port $AnnouncerPort
+        if ($ann.Ok) {
+            $rec = [pscustomobject]@{
+                Address = $Address
+                Source  = $Source
+                Url     = $ann.Url
+                Port    = $AnnouncerPort
+                Status  = $ann.Status
+            }
+            Write-ClusterLogIfAvailable -Level Info -Message "Controller discovered via announcer" -Data @{
+                source = $Source; address = $Address; port = $AnnouncerPort; status = $ann.Status
+            }
+            return $rec
+        } else {
+            Write-ClusterLogIfAvailable -Level Debug -Message "Announcer probe miss" -Data @{
+                source = $Source; address = $Address; port = $AnnouncerPort; reason = $ann.Reason
+            }
+        }
+
+        # Pass 2: MeshCentral HTTPS marker fallback
         foreach ($port in $CandidatePorts) {
             $probe = Test-ControllerEndpoint -Address $Address -Port $port -ProbePath $ProbePath
             if ($probe.Ok) {
@@ -410,6 +507,7 @@ function Find-Controller {
 Export-ModuleMember -Function `
     Find-Controller, `
     Test-ControllerEndpoint, `
+    Test-AnnouncerEndpoint, `
     Get-SubnetScanTarget
 
 # Test seams (Set-DiscoveryInvoker, Reset-DiscoveryInvoker) are intentionally
