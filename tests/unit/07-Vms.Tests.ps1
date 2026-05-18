@@ -151,6 +151,54 @@ Describe 'Invoke-VmsStage' {
         $caps.Created.Count | Should -Be 0
     }
 
+    It 'defaults golden VHDX SMB path to controller ClusterShare\vhdx\ (real-hardware bug 16)' {
+        # Regression for bug 16: the old default was '\\<addr>\images\golden.vhdx'
+        # which does not match windows-cluster-controller's published share
+        # ('ClusterShare', subdir 'vhdx'). Capture the path passed to
+        # SourceGoldenVhdx and assert it now uses the controller convention.
+        $script:capturedSmb   = $null
+        $script:capturedHttps = $null
+        $caps = Set-VmStub
+        Set-VmInvoker -Name SourceGoldenVhdx -ScriptBlock {
+            param($smb,$https,$local,$dst)
+            $script:capturedSmb   = $smb
+            $script:capturedHttps = $https
+            @{ Ok = $false; Source = 'none'; Detail = 'captured-for-test' }
+        }
+        Set-HappyHardware
+        $cfg = [pscustomobject]@{
+            controller = [pscustomobject]@{ address = '10.0.0.7' }
+        }
+        Invoke-VmsStage -Config $cfg -Count 1 6>$null | Out-Null
+        $script:capturedSmb   | Should -Be '\\10.0.0.7\ClusterShare\vhdx\golden.vhdx'
+        $script:capturedHttps | Should -Be 'https://10.0.0.7/golden.vhdx'
+    }
+
+    It 'honors Config.golden_vhdx overrides for share / subdir / filename' {
+        $script:capturedSmb   = $null
+        $script:capturedHttps = $null
+        $caps = Set-VmStub
+        Set-VmInvoker -Name SourceGoldenVhdx -ScriptBlock {
+            param($smb,$https,$local,$dst)
+            $script:capturedSmb   = $smb
+            $script:capturedHttps = $https
+            @{ Ok = $false; Source = 'none'; Detail = 'captured-for-test' }
+        }
+        Set-HappyHardware
+        $cfg = [pscustomobject]@{
+            controller  = [pscustomobject]@{ address = '10.0.0.7' }
+            golden_vhdx = [pscustomobject]@{
+                smb_share  = 'CustomShare'
+                smb_subdir = 'images'
+                filename   = 'base.vhdx'
+                https_url  = 'https://files.example/base.vhdx'
+            }
+        }
+        Invoke-VmsStage -Config $cfg -Count 1 6>$null | Out-Null
+        $script:capturedSmb   | Should -Be '\\10.0.0.7\CustomShare\images\base.vhdx'
+        $script:capturedHttps | Should -Be 'https://files.example/base.vhdx'
+    }
+
     It 'Warn on missing SHA256, Pass on matching SHA256' {
         # Use VmStorageDrive override to a path NOT under the real D: drive so we can probe via mock.
         $caps = Set-VmStub
