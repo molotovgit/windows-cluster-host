@@ -222,7 +222,23 @@ function Invoke-NetworkStage {
     }
 
     # ---------- subnet selection ----------
-    $chosenCidr = Find-FreeSubnet -Candidates $CandidateSubnets
+    # Prefer reuse when a NetNat from a prior run already exists with a
+    # prefix that's in our candidate list. Without this short-circuit,
+    # Find-FreeSubnet would see the NetNat's own route, reject that
+    # candidate as "taken", pick the next one, and then the conflict check
+    # below would Fail because Windows only allows one NetNat per host.
+    # Net effect: a re-run on a host with a stale NetNat at a candidate
+    # prefix would never succeed without operator cleanup. Reusing it is
+    # the correct idempotent behavior.
+    $existingNats = if ([bool](& $script:NetworkInvokers.HasNetNatCmdlet)) {
+        @(& $script:NetworkInvokers.GetNetNat)
+    } else { @() }
+    $reusableCidr = $null
+    foreach ($c in $CandidateSubnets) {
+        $match = @($existingNats | Where-Object { $_.InternalIPInterfaceAddressPrefix -eq $c })
+        if ($match.Count -gt 0) { $reusableCidr = $c; break }
+    }
+    $chosenCidr = if ($reusableCidr) { $reusableCidr } else { Find-FreeSubnet -Candidates $CandidateSubnets }
     if (-not $chosenCidr) {
         $result = [pscustomobject]@{
             Overall = 'Fail'; Method = 'None'; SwitchName = $SwitchName; Subnet = $null; GatewayIp = $null

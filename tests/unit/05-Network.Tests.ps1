@@ -141,6 +141,43 @@ Describe 'Invoke-NetworkStage' {
         @($caps.Calls | Where-Object { $_ -like 'NewNetNat*' }).Count | Should -Be 0
     }
 
+    It 'reuses an existing NetNat whose prefix is in the candidate list (real-hardware bug 15)' {
+        # Regression for bug 15: a prior partial install left a NetNat at
+        # 192.168.100.0/24 (plus its associated route). Without the reuse
+        # short-circuit, Find-FreeSubnet would reject 192.168.100.0/24
+        # because of the existing route, pick the next candidate
+        # (192.168.150.0/24), and then the "different NetNat exists" check
+        # would Fail because Windows allows only one NetNat per host. Correct
+        # behavior: reuse the existing NetNat by preferring its prefix.
+        $caps = Set-NetStub `
+            -Routes @(
+                [pscustomobject]@{ DestinationPrefix = '192.168.100.0/24' }
+            ) `
+            -Nats @(
+                [pscustomobject]@{ Name = 'ClusterNATSwitchNat'; InternalIPInterfaceAddressPrefix = '192.168.100.0/24' }
+            )
+        $r = Invoke-NetworkStage -SwitchName 'ClusterNATSwitch' `
+            -CandidateSubnets @('192.168.100.0/24','192.168.150.0/24') 6>$null
+        $r.Overall | Should -Be 'Pass'
+        $r.Subnet  | Should -Be '192.168.100.0/24'
+        # Must NOT attempt to create a second NetNat.
+        @($caps.Calls | Where-Object { $_ -like 'NewNetNat*' }).Count | Should -Be 0
+    }
+
+    It 'still picks a fresh subnet when the existing NetNat is NOT in the candidate list' {
+        # Reuse short-circuit only fires for candidate-listed prefixes; if
+        # the operator changed the candidate list and there is a stale NAT
+        # outside that list, the existing "different NetNat exists" Fail
+        # path must still trigger (preserves bug-15 fix from masking the
+        # real one-NAT-per-host constraint).
+        $caps = Set-NetStub -Nats @(
+            [pscustomobject]@{ Name = 'LegacyNat'; InternalIPInterfaceAddressPrefix = '10.99.0.0/24' }
+        )
+        $r = Invoke-NetworkStage -CandidateSubnets @('192.168.100.0/24','192.168.150.0/24') 6>$null
+        $r.Overall | Should -Be 'Fail'
+        $r.Detail  | Should -Match 'LegacyNat'
+    }
+
     It 'existing-state alias check is strict: vEthernet (ClusterStorage) does not match SwitchName=Cluster' {
         $caps = Set-NetStub `
             -Switches @([pscustomobject]@{ Name = 'Cluster'; SwitchType = 'Internal'; NetAdapterInterfaceDescription = '' }) `
