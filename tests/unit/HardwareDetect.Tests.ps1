@@ -315,9 +315,15 @@ Describe 'Get-VirtualizationSupport' {
         $r = Get-VirtualizationSupport 6>$null
         $r.HyperVisorPresent                | Should -BeTrue
         $r.Reasons['HyperVisorPresentSource'] | Should -Be 'Get-ComputerInfo'
-        $r.Reasons['VtSource']                | Should -Be 'unknown'
-        $r.Reasons['SlatSource']              | Should -Be 'unknown'
-        $r.CanRunHyperV                       | Should -BeFalse   # unknown VT/SLAT is conservative-false
+        # When Hyper-V is already running, the OS becomes a guest of it and
+        # can't read the underlying CPU flags -- but VT + SLAT MUST be
+        # supported (the hypervisor wouldn't be running otherwise). We
+        # infer Supported=True and tag the source accordingly.
+        $r.VtSupported                        | Should -BeTrue
+        $r.SlatSupported                      | Should -BeTrue
+        $r.Reasons['VtSource']                | Should -Be 'inferred-from-HyperVisorPresent'
+        $r.Reasons['SlatSource']              | Should -Be 'inferred-from-HyperVisorPresent'
+        $r.CanRunHyperV                       | Should -BeTrue   # Hyper-V is literally already running
     }
 }
 

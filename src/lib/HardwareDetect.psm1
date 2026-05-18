@@ -435,6 +435,26 @@ function Get-VirtualizationSupport {
     $hvPresent = if ($reasons.ContainsKey('HyperVisorPresent')) { [bool]$reasons['HyperVisorPresent'] } else { $false }
     $vt        = if ($reasons.ContainsKey('VtSupported'))       { [bool]$reasons['VtSupported']       } else { $false }
     $slat      = if ($reasons.ContainsKey('SlatSupported'))     { [bool]$reasons['SlatSupported']     } else { $false }
+
+    # When the Hyper-V hypervisor is already running, the host OS becomes a
+    # guest of it and can no longer read Win32_Processor.VirtualizationFirmware-
+    # Enabled (returns False) nor Get-ComputerInfo's SLAT field (returns blank).
+    # But VT and SLAT MUST be supported -- the hypervisor couldn't be running
+    # otherwise. So when HyperVisorPresent=True, infer both Supported=True and
+    # mark the source so the log reflects the inference, not a false probe.
+    if ($hvPresent) {
+        if (-not $vt) {
+            $reasons['VtSupported'] = $true
+            $reasons['VtSource']    = 'inferred-from-HyperVisorPresent'
+            $vt = $true
+        }
+        if (-not $slat) {
+            $reasons['SlatSupported'] = $true
+            $reasons['SlatSource']    = 'inferred-from-HyperVisorPresent'
+            $slat = $true
+        }
+    }
+
     # CanRunHyperV is conservative: requires BOTH VT and SLAT to be CONFIRMED true.
     # Unknown values are treated as 'not confirmed', so CanRunHyperV stays false.
     $canRun    = $vt -and $slat
