@@ -214,6 +214,27 @@ function Invoke-VerifyStage {
     $checks = New-Object System.Collections.Generic.List[object]
     $vmInfo = @{}
 
+    # In dry-run, no stage actually mutated anything. Probing for the
+    # services + VMs the previous stages would have installed is guaranteed
+    # to find nothing -- a misleading "Fail" given the operator was just
+    # previewing the plan. Soft-pass and let the orchestrator finish clean.
+    if ($DryRun) {
+        Add-VerifyCheck $checks 'Verify (DryRun)' 'Pass' '-DryRun: skipping real health checks; orchestrator dry-run is enough.'
+        if (Get-Command -Name 'Write-ClusterLog' -ErrorAction SilentlyContinue) {
+            Write-ClusterLog -Level Info -Stage 'verify' -Message 'Verify stage: -DryRun, skipping real probes.'
+        }
+        return [pscustomobject]@{
+            Overall     = 'Pass'
+            Checks      = $checks.ToArray()
+            Summary     = ''
+            SummaryPath = $SummaryPath
+            VmInfo      = $vmInfo
+            PassCount   = 1
+            WarnCount   = 0
+            FailCount   = 0
+        }
+    }
+
     # ---------- 1. Mesh Agent service ----------
     $meshSvc = & $script:VerifyInvokers.GetService 'Mesh Agent'
     if ($meshSvc.Found -and $meshSvc.Status -eq 'Running') {
