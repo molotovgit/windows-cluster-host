@@ -53,11 +53,28 @@
     Required: complexity must satisfy Windows' default policy
     (>=8 chars, upper+lower+digit+symbol).
 
+.PARAMETER AgentGroup
+    Which MeshCentral device group the cloned VMs should auto-register
+    into. Defaults to 'cluster-vms' because clones of a golden VHDX are,
+    by definition, VMs — not physical hosts. Picking 'cluster-hosts' here
+    is the historical (and footgun) behaviour the original build session
+    hit: VMs ended up in cluster-hosts and had to be moved by hand. Pass
+    -AgentGroup 'cluster-hosts' only if you have a deliberate reason.
+
+    Used to derive the default -MeshAgentInstaller path when that
+    parameter is omitted.
+
 .PARAMETER MeshAgentInstaller
-    Path on THIS machine to the meshagent64-<group>.exe file produced by
-    windows-cluster-controller's Stage 10 AgentDownload. Copied into the
-    VHDX so VMs don't need network at firstboot time before they get
-    their static IP.
+    Optional. Path on THIS machine to the meshagent64-<group>.exe file
+    produced by windows-cluster-controller's Stage 10 AgentDownload.
+    Copied into the VHDX so VMs don't need network at firstboot time
+    before they get their static IP. When omitted, defaults to
+    \\<ControllerAddress>\<ControllerSmbShare>\agents\<AgentGroup>\meshagent64-<AgentGroup>.exe
+
+.PARAMETER ControllerSmbShare
+    Share name on the controller that hosts the agent installers + golden
+    VHDX. Defaults to 'ClusterShare' (the name Stage 11 of the controller
+    creates). Only used to construct the default -MeshAgentInstaller path.
 
 .PARAMETER FirstbootScript
     Path to cluster-vm-firstboot.ps1 (default: sibling of this script).
@@ -66,10 +83,19 @@
     Path to cluster-firstboot-launcher.cmd (default: sibling of this script).
 
 .EXAMPLE
+    # Common path: VMs auto-register in cluster-vms.
+    .\Prepare-GoldenVhdx.ps1 -VhdxPath C:\VMs\golden.vhdx `
+        -ControllerAddress 192.168.1.22 `
+        -AdminPassword 'Cluster1!Secret'
+
+.EXAMPLE
+    # Explicit installer + alternate group (e.g. prepping a bare-metal-like
+    # image for use as a host clone).
     .\Prepare-GoldenVhdx.ps1 -VhdxPath C:\VMs\golden.vhdx `
         -ControllerAddress 192.168.1.22 `
         -AdminPassword 'Cluster1!Secret' `
-        -MeshAgentInstaller '\\192.168.1.22\ClusterShare\agents\cluster-vms\meshagent64-cluster-vms.exe'
+        -AgentGroup 'cluster-hosts' `
+        -MeshAgentInstaller 'D:\stage\meshagent64-cluster-hosts.exe'
 
 .NOTES
     Must run elevated. Mount-VHD requires admin.
@@ -81,7 +107,9 @@ param(
     [Parameter(Mandatory)][string]$ControllerAddress,
     [int]$ControllerPort = 443,
     [Parameter(Mandatory)][string]$AdminPassword,
-    [Parameter(Mandatory)][string]$MeshAgentInstaller,
+    [string]$AgentGroup = 'cluster-vms',
+    [string]$MeshAgentInstaller,
+    [string]$ControllerSmbShare = 'ClusterShare',
     [string]$FirstbootScript = (Join-Path $PSScriptRoot 'cluster-vm-firstboot.ps1'),
     [string]$LauncherScript  = (Join-Path $PSScriptRoot 'cluster-firstboot-launcher.cmd')
 )
@@ -120,6 +148,20 @@ function Resolve-WindowsVolume {
 
 # ---------- Validate inputs ----------
 Assert-Admin
+
+# AgentGroup is used both to pick the installer (when -MeshAgentInstaller is
+# omitted) and to keep the file-name on disk consistent with what the firstboot
+# script picks up via Get-ChildItem 'C:\Setup\meshagent64*.exe'. Disallow
+# whitespace and path separators so we don't smuggle SMB segments here.
+if ($AgentGroup -match '[\s\\/:*?"<>|]' -or [string]::IsNullOrWhiteSpace($AgentGroup)) {
+    throw "Invalid -AgentGroup '$AgentGroup' (must be a simple group name like 'cluster-vms')."
+}
+
+if (-not $MeshAgentInstaller) {
+    $MeshAgentInstaller = "\\$ControllerAddress\$ControllerSmbShare\agents\$AgentGroup\meshagent64-$AgentGroup.exe"
+    Write-Host "MeshAgentInstaller defaulted to: $MeshAgentInstaller" -ForegroundColor DarkGray
+}
+
 foreach ($req in $VhdxPath, $FirstbootScript, $LauncherScript, $MeshAgentInstaller) {
     if (-not (Test-Path -LiteralPath $req)) {
         throw "Required file not found: $req"
@@ -207,6 +249,17 @@ Version=65539
     [System.IO.File]::WriteAllText($gptIni, $gptIniBody, [System.Text.UnicodeEncoding]::new($false, $true))
     Write-Host "  wrote $gptIni"
 
+    # Sweep any stale meshagent64-*.exe so firstboot's
+    # Get-ChildItem 'C:\Setup\meshagent64*.exe' | Select-Object -First 1
+    # can't pick the wrong group on a re-prepped image (clusters-hosts vs
+    # clusters-vms sort alphabetically; without this purge a stale
+    # cluster-hosts installer would always win).
+    $stale = @(Get-ChildItem -LiteralPath $setupDir -Filter 'meshagent64*.exe' -ErrorAction SilentlyContinue)
+    foreach ($s in $stale) {
+        Remove-Item -LiteralPath $s.FullName -Force -ErrorAction SilentlyContinue
+        Write-Host "  removed stale $($s.FullName)"
+    }
+
     # The MeshAgent installer ships next to the firstboot script.
     $agentInVhdx = Join-Path $setupDir ([System.IO.Path]::GetFileName($MeshAgentInstaller))
     Copy-Item -LiteralPath $MeshAgentInstaller -Destination $agentInVhdx -Force
@@ -229,7 +282,7 @@ Version=65539
 
 Write-Host "" -ForegroundColor Green
 Write-Host "Done. Clones of $VhdxPath will, on first boot:" -ForegroundColor Green
-Write-Host "  - Read their VM name from Hyper-V KVP" -ForegroundColor Green
-Write-Host "  - Set a static IP 192.168.100.X (X derived from name)" -ForegroundColor Green
+Write-Host "  - Derive hostname/static IP from primary NIC MAC" -ForegroundColor Green
 Write-Host "  - Create local admin 'cluster-admin' with the password you supplied" -ForegroundColor Green
 Write-Host "  - Install MeshAgent and point it at wss://${ControllerAddress}:${ControllerPort}/agent.ashx" -ForegroundColor Green
+Write-Host "  - Auto-register in MeshCentral device group: $AgentGroup" -ForegroundColor Green
