@@ -3,14 +3,21 @@
     One-liner bootstrap for the windows-cluster-host setup.
 
 .DESCRIPTION
-    Operator copy-paste at an elevated PowerShell prompt:
+    Operator copy-paste at an elevated PowerShell prompt. Three source modes:
 
-        $env:CLUSTERHOST_CONTROLLER = '10.0.0.7'   # optional: pin the controller
-        iwr -useb https://10.0.0.7/install.ps1 | iex
+    1) From GitHub (no controller required to host files yet):
 
-    Or, with the repo already on disk:
+         iwr -useb https://raw.githubusercontent.com/molotovgit/windows-cluster-host/main/install.ps1 -OutFile install.ps1
+         .\install.ps1 -FromGitHub -ControllerAddress 10.0.0.7
 
-        .\install.ps1 -ControllerAddress 10.0.0.7
+    2) From a controller that already serves the repo zip:
+
+         iwr -useb https://10.0.0.7/install.ps1 | iex
+         # falls through to https://10.0.0.7/cluster-host.zip
+
+    3) From a local checkout:
+
+         .\install.ps1 -ControllerAddress 10.0.0.7
 
     Steps the bootstrap performs:
       1. Check PowerShell version (>= 7); refuse to run under Windows PowerShell 5.1
@@ -38,6 +45,10 @@ param(
     [string]$ControllerAddress,
     [string]$SourceZip,
     [string]$ZipUrl,
+    [switch]$FromGitHub,
+    [string]$GitHubOrg = 'molotovgit',
+    [string]$GitHubRepo = 'windows-cluster-host',
+    [string]$GitHubBranch = 'main',
     [string]$StagingRoot = (Join-Path $env:ProgramData 'ClusterHost\src'),
     [string]$ConfigPath,
     [switch]$WriteConfig,
@@ -69,8 +80,20 @@ function Assert-Prerequisite {
 }
 
 function Resolve-ZipUrl {
-    param([string]$Address,[string]$Override)
+    param(
+        [string]$Address,
+        [string]$Override,
+        [switch]$FromGitHub,
+        [string]$GitHubOrg,
+        [string]$GitHubRepo,
+        [string]$GitHubBranch
+    )
     if ($Override) { return $Override }
+    if ($FromGitHub) {
+        # GitHub archive URL produces a zip with a single top-level dir
+        # "$GitHubRepo-$GitHubBranch/..." which Expand-RepoZip already flattens.
+        return "https://github.com/$GitHubOrg/$GitHubRepo/archive/refs/heads/$GitHubBranch.zip"
+    }
     if (-not $Address) { return $null }
     return "https://$Address/cluster-host.zip"
 }
@@ -237,9 +260,11 @@ if (-not $SkipDownload) {
             Write-Host "Copied repo from $PSScriptRoot -> $StagingRoot" -ForegroundColor Yellow
             $resolvedRoot = $local
         } else {
-            $url = Resolve-ZipUrl -Address $ControllerAddress -Override $ZipUrl
+            $url = Resolve-ZipUrl -Address $ControllerAddress -Override $ZipUrl `
+                                   -FromGitHub:$FromGitHub `
+                                   -GitHubOrg $GitHubOrg -GitHubRepo $GitHubRepo -GitHubBranch $GitHubBranch
             Assert-Prerequisite -Condition ([bool]$url) `
-                                 -FailureMessage 'No -SourceZip, no local repo, and no -ControllerAddress / -ZipUrl given. Cannot source the repo.' `
+                                 -FailureMessage 'No -SourceZip, no local repo, and no -ControllerAddress / -ZipUrl / -FromGitHub given. Cannot source the repo.' `
                                  -ExitCode 14
             $tmpZip = Join-Path $env:TEMP ("cluster-host-" + [guid]::NewGuid().ToString('N').Substring(0,8) + '.zip')
             Write-Host "Downloading $url -> $tmpZip" -ForegroundColor Yellow

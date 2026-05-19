@@ -37,15 +37,23 @@ This repo is **half of a pair**. The companion repo, [`windows-cluster-controlle
 orchestrator dry-run passes Overall=Pass on a fully-stubbed Win11 Pro
 sandbox.
 
-**One-liner install** (paste under an elevated **pwsh** prompt):
+**One-liner install** (paste under an elevated **pwsh 7** prompt):
 
 ```powershell
-iwr -useb https://<controller>/install.ps1 | iex
+iwr -useb https://raw.githubusercontent.com/molotovgit/windows-cluster-host/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -FromGitHub -ControllerAddress 10.0.0.7 -WriteConfig
 ```
+
+`-FromGitHub` makes `install.ps1` pull the rest of the repo from the GitHub
+archive zip (`molotovgit/windows-cluster-host @ main`) — the default
+controller configuration does NOT serve install files over HTTPS, so this is
+the recommended bootstrap path.
 
 Or from a local checkout (USB stick, share, git clone):
 
 ```powershell
+git clone https://github.com/molotovgit/windows-cluster-host
+cd windows-cluster-host
 .\install.ps1 -ControllerAddress 10.0.0.7 -WriteConfig
 ```
 
